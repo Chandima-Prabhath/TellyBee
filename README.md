@@ -228,6 +228,19 @@ Notes:
   a bot that is still registered with the cloud. After logging out, the bot
   cannot use the cloud API for ~10 minutes (relevant only if you switch
   `API_BASE` back off).
+- **How the files actually reach `./downloads`:** in `--local` mode
+  `getFile` returns an *absolute path* inside the botapi container and the
+  server has **no HTTP file endpoint at all**. The compose file therefore
+  mounts the `botapi-data` volume into the tellybee container as well
+  (read-only), and the bot stream-copies files straight from it — fast and
+  token-safe. If you maintain your own compose file, make sure the tellybee
+  service includes:
+
+  ```yaml
+  volumes:
+    - botapi-data:/var/lib/telegram-bot-api:ro
+  ```
+
 - The `botapi` container is deliberately **not** published to the host — only
   the bot talks to it over the internal compose network. Exposing an
   unauthenticated Bot API server would let anyone control any bot token they
@@ -236,9 +249,12 @@ Notes:
 - Telegram files are cached inside the `botapi-data` **named volume** before
   the bot copies them to `./downloads` — a 2 GB file needs ~4 GB of free disk
   at download time. Check usage with `docker system df`.
-- Don't want the local server? Comment out the whole `botapi` service **and**
-  the `depends_on` entry above it, remove `API_BASE` from `.env`, and set
-  `MAX_FILE_SIZE=20MB`.
+- The bot token is masked (`***`) everywhere in the bot's own logs, and error
+  messages shown in chat receipts never contain it — Bot API download URLs
+  embed the token, so keep `docker compose logs` sharing safe too.
+- Don't want the local server? Comment out the whole `botapi` service, the
+  `depends_on` entry **and** the `botapi-data` volume mount above, remove
+  `API_BASE` from `.env`, and set `MAX_FILE_SIZE=20MB`.
 
 ---
 
@@ -263,6 +279,8 @@ before contributing (humans and AI assistants alike).
 | `Cannot connect to host botapi:8081` / `Connect call failed` | The two containers aren't on the same network — **`docker compose restart` does not apply compose-file edits**. Run `docker compose down && docker compose up -d --build` instead. The bot retries on its own in the meantime. |
 | botapi log shows no `--api-id=` flag | Its environment didn't get your credentials — same cause as above: recreate with `docker compose up -d --build` (never `restart`). |
 | Local server answers `404 Not Found` | Missing cloud `logOut` handshake — the bot performs it automatically at startup; if it could not reach the internet, restart after a minute. |
+| Every download fails with `404 … /file/bot…` | Old image downloaded via an HTTP file endpoint — local Bot API servers don't have one. Update to ≥ 0.1.2 and make sure the tellybee service mounts `botapi-data:/var/lib/telegram-bot-api:ro`, then `docker compose up -d --build`. |
+| `…is not mounted in this container…` in job errors | The `botapi-data` volume is not shared with the tellybee service — add `botapi-data:/var/lib/telegram-bot-api:ro` to its `volumes:` and recreate the container. |
 | `unable to open database file` / `not writable` | Bind mounts owned by root — the entrypoint fixes this automatically on new images; manually: `sudo chown -R 1000:1000 ./data ./downloads`, then `docker compose restart`. |
 | `BOT_TOKEN does not look like…` | Re-copy the token from @BotFather — no spaces, full string. |
 | Bot silent for non-admins | You set `ADMIN_IDS` only — add your friends via `/allow` or `ALLOWED_USER_IDS`. |

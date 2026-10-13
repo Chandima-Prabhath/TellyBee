@@ -129,7 +129,7 @@ async def cmd_disallow(message: Message, command: CommandObject, db: Database) -
 
 def _target_user(message: Message, command: CommandObject, forward: bool = True):
     """Resolve the target of /allow|/disallow: numeric arg, or the replied-to/forwarded author."""
-    arg = (command.argument or "").strip()
+    arg = (command.args or "").strip()
     if arg.lstrip("-").isdigit():
         return int(arg), None, None
     if message.reply_to_message and message.reply_to_message.from_user:

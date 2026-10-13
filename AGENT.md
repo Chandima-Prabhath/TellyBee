@@ -158,9 +158,25 @@ models — see `tests/test_media_types.py` for the pattern.
 - **aiogram `Bot(token, session, default)`** — there is no `base=` kwarg;
   a custom Bot API server goes through
   `AiohttpSession(api=TelegramAPIServer.from_base(...))`.
-- Download URL = `bot.session.api.file_url(bot.token, file.file_path)` —
-  honors custom API bases automatically. `getFile` responses are cached
-  (`_FileCache`, TTL 15 min) because Telegram rate-limits that call.
+- **Local Bot API servers have NO HTTP file endpoint.** Verified against
+  10.3 sources: `HttpConnection::handle` only routes `/bot<token>/<method>`;
+  `/file/...` always 404s. In `--local` mode `getFile` returns an *absolute
+  path* inside the server's storage, so the engine stream-copies from the
+  shared `botapi-data` volume (mounted read-only at the same path). HTTP
+  fetching stays only for the cloud API.
+- Download URL (cloud mode) = `bot.session.api.file_url(bot.token,
+  file.file_path)` — honors custom API bases automatically. `getFile`
+  responses are cached (`_FileCache`, TTL 15 min) because Telegram
+  rate-limits that call.
+- **aiogram 3.7+ error handlers receive one `ErrorEvent`**
+  (`event.update` / `event.exception`) — a `(event, exception)` signature
+  crashes with `TypeError` at raise time.
+- **aiogram's `CommandObject` exposes `.args`**, not `.argument`.
+- **The bot token appears in Bot API URLs** — exception strings then leak it
+  into logs and chat receipts. `logging_setup.SecretScrubbingFormatter`
+  masks it at the sink, and the engine masks job error texts; keep both.
+- **`__slots__` classes reject new attributes** — `setattr(obj, '_x', ...)`
+  on a slotted instance raises `AttributeError`; declare the slot.
 - **`parse_size` suffix matching must be longest-first** ("20mb" ends with
   "b", too) — it now uses an anchored regex; keep it that way.
 - Telegram rate-limits message edits; the notifier's throttling

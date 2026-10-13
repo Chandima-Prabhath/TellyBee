@@ -10,7 +10,12 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
-from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    ErrorEvent,
+)
 
 from app.config import Settings
 from app.db import Database
@@ -111,11 +116,18 @@ def build_dispatcher(settings: Settings, db: Database, manager: DownloadManager)
     dp.message.outer_middleware(AlbumMiddleware())
 
     @dp.errors()
-    async def on_error(event, exception: Exception) -> bool:
-        logger.exception("unhandled error processing update: %s", exception)
+    async def on_error(event: ErrorEvent) -> bool:
+        # aiogram 3.7+ hands error handlers a single ErrorEvent carrying both
+        # the original update and the exception.
+        logger.error(
+            "unhandled error processing update: %s: %s",
+            type(event.exception).__name__,
+            event.exception,
+            exc_info=event.exception,
+        )
         # Inform the originating chat when we can identify it.
-        update = getattr(event, "update", None)
-        message = getattr(update, "message", None)
+        update = event.update
+        message = getattr(update, "message", None) or getattr(update, "edited_message", None)
         if message is not None:
             try:
                 await message.answer(

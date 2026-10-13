@@ -48,7 +48,7 @@ class _Group:
     """A set of jobs sharing one chat message."""
 
     __slots__ = ("key", "chat_id", "message_id", "jobs", "results", "lock",
-                 "updater_task", "created_at", "broken")
+                 "updater_task", "created_at", "broken", "_last_edit")
 
     def __init__(self, key: str, chat_id: int):
         self.key = key
@@ -60,6 +60,7 @@ class _Group:
         self.updater_task: asyncio.Task | None = None
         self.created_at = time.monotonic()
         self.broken = False  # set when sending failed (chat unreachable)
+        self._last_edit = 0.0  # last progress-message edit (throttle)
 
     @property
     def total_bytes(self) -> int:
@@ -178,10 +179,9 @@ class Notifier:
 
     async def _edit_throttled(self, group: _Group) -> None:
         now = time.monotonic()
-        last = getattr(group, "_last_edit", 0.0)
-        if now - last < self._settings.progress_edit_interval:
+        if now - group._last_edit < self._settings.progress_edit_interval:
             return
-        group._last_edit = now  # type: ignore[attr-defined]
+        group._last_edit = now
         await self._edit_message(group, self._progress_text(group))
 
     async def _edit_message(self, group: _Group, text: str) -> None:

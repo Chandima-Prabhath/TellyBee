@@ -29,6 +29,12 @@ services:
     volumes:
       - ./downloads:/app/downloads
       - ./data:/app/data
+      # REQUIRED with the local Bot API server (API_BASE=http://botapi:8081):
+      # in --local mode getFile returns absolute paths into the server's
+      # storage and the server has NO HTTP file endpoint — tellybee reads
+      # the bytes straight from this shared, read-only volume. Remove this
+      # line only if you disabled the botapi service.
+      - botapi-data:/var/lib/telegram-bot-api:ro
     ports:
       # Health endpoint /healthz (and the webhook receiver if WEBHOOK_URL
       # is set). Bound to localhost by default — drop the "127.0.0.1:"

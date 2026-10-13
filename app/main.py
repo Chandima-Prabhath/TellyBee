@@ -155,7 +155,7 @@ def _ensure_writable_dir(directory: Path) -> None:
 
 async def run() -> None:
     settings = _load_settings()
-    setup_logging(settings.log_level, settings.log_format)
+    setup_logging(settings.log_level, settings.log_format, secrets=(settings.bot_token,))
     logger.info("🐝 TellyBee v%s starting", __version__)
     logger.info("config: %s", settings.summary())
 
@@ -277,7 +277,7 @@ async def run() -> None:
 def main() -> None:
     if "--check" in sys.argv:
         settings = _load_settings()
-        setup_logging(settings.log_level, settings.log_format)
+        setup_logging(settings.log_level, settings.log_format, secrets=(settings.bot_token,))
         print(f"✅ configuration valid: {settings.summary()}")
         return
     try:
