@@ -1,10 +1,15 @@
-"""Regression tests for the local Bot API server mode (0.1.2 – 0.1.3).
+"""Regression tests for the local Bot API server mode (0.1.2 – 0.1.4).
 
 Covers:
 * engine stream-copies files from the server's shared storage (no HTTP),
 * actionable errors when the volume is not shared / file not yet present,
 * owner-only permissions on the server storage fail fast with the exact
   uid-alignment remedy (0.1.3) instead of burning retries on EACCES,
+* getFile runs with an extended per-request timeout in local mode — the
+  server answers only after fetching the whole file, so aiogram's default
+  60s session timeout killed every first-time download of a big file
+  (0.1.4, "HTTP Client says - Request timeout error"),
+* /cancel stays responsive while getFile waits out a server-side download,
 * the bot token is masked in errors and log output,
 * the dispatcher error handler accepts aiogram 3.31's ErrorEvent,
 * the notifier's edit throttle works (_Group slots),
@@ -13,18 +18,20 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from aiogram.filters import CommandObject
 from aiogram.types import Chat, File, Message, Update, User
 
-from app.queue.engine import DownloadEngine, DownloadError
+from app.queue.engine import DownloadEngine, DownloadError, JobCancelled
 from app.queue.jobs import new_job_id
 from app.services.filenaming import UserRef
 from tests.conftest import VALID_TOKEN, make_message
@@ -48,8 +55,36 @@ class _FakeBot:
         self.token = token
         self.session = SimpleNamespace(api=_FakeApi(is_local))
         self._file = file
+        self.calls: list[dict] = []
 
-    async def get_file(self, file_id: str) -> File:
+    async def get_file(
+        self, file_id: str, request_timeout: int | None = None
+    ) -> File:
+        self.calls.append({"file_id": file_id, "request_timeout": request_timeout})
+        return self._file
+
+
+class _SlowFakeBot(_FakeBot):
+    """getFile that blocks — like a local server still downloading the file.
+
+    Records whether the in-flight request was aborted (CancelledError seen
+    inside the coroutine) so tests can assert /cancel reached the HTTP call.
+    """
+
+    def __init__(self, token: str, is_local: bool, file: File, delay: float) -> None:
+        super().__init__(token, is_local, file)
+        self._delay = delay
+        self.interrupted = False
+
+    async def get_file(
+        self, file_id: str, request_timeout: int | None = None
+    ) -> File:
+        self.calls.append({"file_id": file_id, "request_timeout": request_timeout})
+        try:
+            await asyncio.sleep(self._delay)
+        except asyncio.CancelledError:
+            self.interrupted = True
+            raise
         return self._file
 
 
@@ -210,6 +245,97 @@ async def test_unreadable_server_storage_fails_fast(settings, tmp_path, monkeypa
         assert job.attempts == 1  # EACCES never resolves on retry — no backoff
     finally:
         token_dir.chmod(0o700)  # let pytest's tmp_path cleanup remove it
+
+
+# ── local mode: getFile needs an extended request timeout (0.1.4) ───────────
+
+
+async def test_local_getfile_uses_extended_request_timeout(
+    settings, tmp_path, monkeypatch
+):
+    """The server answers getFile only after fetching the whole file.
+
+    aiogram's session default is 60s, which killed every first-time download
+    of a large file with "HTTP Client says - Request timeout error" — in
+    local mode the call must carry the GETFILE_TIMEOUT override instead.
+    """
+    botapi = tmp_path / "botapi"
+    (botapi / "documents").mkdir(parents=True)
+    src = botapi / "documents" / "file_0"
+    src.write_bytes(b"payload")
+
+    bot = _SlowFakeBot(
+        VALID_TOKEN,
+        is_local=True,
+        delay=0.2,  # completes within one cancel-poll tick
+        file=File(file_id="f1", file_unique_id="u1", file_size=7, file_path=str(src)),
+    )
+    monkeypatch.setattr(DownloadEngine, "LOCAL_FILES_DIR", botapi)
+    engine = DownloadEngine(bot, settings)
+
+    job = _job(tmp_path, "slow.bin", size=7)
+    result = await engine.run(job)
+
+    assert result.bytes_written == 7
+    assert bot.calls == [
+        {"file_id": "file-1", "request_timeout": round(settings.getfile_timeout)}
+    ]
+    assert not bot.interrupted  # completed normally, nothing aborted
+
+
+async def test_cloud_getfile_keeps_session_default(settings):
+    """Cloud getFile is a quick metadata call — no timeout override."""
+    bot = _FakeBot(
+        VALID_TOKEN,
+        is_local=False,
+        file=File(file_id="f", file_unique_id="u", file_path="documents/file_1"),
+    )
+    engine = DownloadEngine(bot, settings)
+
+    path = await engine.resolve_file_path("file-1")
+
+    assert path == "documents/file_1"
+    assert bot.calls == [{"file_id": "file-1", "request_timeout": None}]
+
+
+async def test_cancel_during_slow_getfile_aborts_promptly(
+    settings, tmp_path, monkeypatch
+):
+    """/cancel while the server is still fetching the file must work.
+
+    Without the cancel race the job would keep running — and eventually
+    deliver its receipt — up to GETFILE_TIMEOUT after the user cancelled.
+    """
+    botapi = tmp_path / "botapi"
+    botapi.mkdir()
+    src = botapi / "documents" / "file_0"  # never reached: cancel fires first
+
+    bot = _SlowFakeBot(
+        VALID_TOKEN,
+        is_local=True,
+        delay=30.0,  # simulates a big server-side download in progress
+        file=File(file_id="f1", file_unique_id="u1", file_size=10, file_path=str(src)),
+    )
+    monkeypatch.setattr(DownloadEngine, "LOCAL_FILES_DIR", botapi)
+    engine = DownloadEngine(bot, settings)
+
+    job = _job(tmp_path, "cancelme.bin")
+
+    async def cancel_soon() -> None:
+        await asyncio.sleep(0.1)
+        job.cancel_event.set()
+
+    canceller = asyncio.ensure_future(cancel_soon())
+    t0 = time.monotonic()
+    with pytest.raises(JobCancelled):
+        await engine.run(job)
+    elapsed = time.monotonic() - t0
+
+    await canceller
+    await asyncio.sleep(0.05)  # let the aborted request unwind its CancelledError
+    assert elapsed < 5.0  # detected within one poll tick, not 30s later
+    assert bot.interrupted  # the in-flight getFile request was aborted
+    assert not Path(job.target_path + ".part").exists()  # noqa: ASYNC240 — test assertion
 
 
 # ── token redaction ─────────────────────────────────────────────────────────

@@ -134,8 +134,15 @@ class Settings(BaseSettings):
     download_concurrency: int = 3
     max_queue_size: int = 100
     download_retries: int = 3
-    # Per-file hard timeout in seconds.
+    # Per-file hard timeout in seconds (cloud-mode HTTP transfer).
     download_timeout: float = 900.0
+    # How long a single getFile request may block, in seconds. A local Bot
+    # API server answers getFile only AFTER it has fully fetched the file
+    # from Telegram, so first-time downloads of large files legitimately
+    # take minutes — the default aiogram session timeout (60s) kills them.
+    # Progress survives across retries (the server keeps downloading), but
+    # each retry restarts the client-side wait, so keep this generous.
+    getfile_timeout: float = 1800.0
     chunk_size: int = 262144
     max_file_size: int = 20 * 1024 * 1024
     # Telegram file links are reusable ~1h; cache getFile lookups this long.
@@ -252,6 +259,12 @@ class Settings(BaseSettings):
             raise ValueError("MAX_QUEUE_SIZE must be between 1 and 10000")
         if not 0 <= self.download_retries <= 10:
             raise ValueError("DOWNLOAD_RETRIES must be between 0 and 10")
+        if not 60.0 <= self.getfile_timeout <= 86400.0:
+            raise ValueError(
+                "GETFILE_TIMEOUT must be between 60 and 86400 seconds (a local "
+                "Bot API server can legitimately take minutes to answer getFile "
+                "while it fetches a large file)"
+            )
         if self.chunk_size < 8 * 1024:
             raise ValueError("CHUNK_SIZE must be at least 8KB")
         if self.max_file_size > 2000 * 1024 * 1024:

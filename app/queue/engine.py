@@ -31,6 +31,7 @@ Two transport modes:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import random
@@ -46,6 +47,11 @@ from app.config import Settings
 from app.queue.jobs import DownloadJob
 
 logger = logging.getLogger(__name__)
+
+#: How often the getFile wait checks the job's cancel event. A local Bot API
+#: server answers getFile only after fully fetching the file from Telegram,
+#: which can take minutes — /cancel must stay responsive during that window.
+_GETFILE_CANCEL_POLL = 1.0
 
 
 class JobCancelled(Exception):
@@ -154,17 +160,75 @@ class DownloadEngine:
         token = getattr(self._bot, "token", "")
         return text.replace(token, "***") if token else text
 
-    async def resolve_file_path(self, file_id: str) -> str:
-        """getFile with caching; retryable wrapper handles network hiccups."""
+    async def resolve_file_path(
+        self, file_id: str, job: DownloadJob | None = None
+    ) -> str:
+        """getFile with caching; retryable wrapper handles network hiccups.
+
+        In local mode the Bot API server parks the request and answers only
+        AFTER it has downloaded the whole file from Telegram — minutes for a
+        first-time multi-GB file. The call therefore runs with an extended
+        per-request timeout (``GETFILE_TIMEOUT``) instead of the aiogram
+        session default of 60s, and stays responsive to ``/cancel`` while
+        waiting. A timed-out attempt still makes progress: the server keeps
+        downloading, so the next retry usually returns quickly.
+        """
         cached = self._cache.get(file_id)
         if cached:
             return cached
-        file = await self._bot.get_file(file_id)
+        if self._local_mode:
+            logger.info(
+                "job #%s: waiting for the local Bot API server to fetch the file "
+                "— first-time downloads of large files can take minutes "
+                "(GETFILE_TIMEOUT=%ss)",
+                job.job_id if job else file_id[:12],
+                round(self._settings.getfile_timeout),
+            )
+        # Cloud getFile is a quick metadata call → session default (60s).
+        # Local getFile blocks for the whole server-side download → allow
+        # minutes (seconds, int per aiogram's request_timeout contract).
+        request_timeout = (
+            round(self._settings.getfile_timeout) if self._local_mode else None
+        )
+        file = await self._get_file(file_id, job, request_timeout)
         path = file.file_path
         if not path:
             raise DownloadError("getFile returned an empty file_path")
         self._cache.put(file_id, path)
         return path
+
+    async def _get_file(
+        self, file_id: str, job: DownloadJob | None, request_timeout: int | None
+    ):
+        """Call bot.get_file, racing it against the job's cancel event.
+
+        Without this race a ``/cancel`` issued while the local server is
+        still fetching the file would be ignored until the transfer
+        finished (up to ``GETFILE_TIMEOUT`` later) — the job would then
+        complete and deliver its receipt despite being cancelled.
+        """
+        get_task = asyncio.ensure_future(
+            self._bot.get_file(file_id, request_timeout=request_timeout)
+        )
+        if job is None:
+            return await get_task
+        try:
+            while not job.is_cancelled():
+                done, _ = await asyncio.wait(
+                    {get_task}, timeout=_GETFILE_CANCEL_POLL
+                )
+                if done:
+                    return get_task.result()
+            raise JobCancelled(job.job_id)
+        finally:
+            if not get_task.done():
+                get_task.cancel()
+            if get_task.done() and not get_task.cancelled():
+                # Retrieve a pending exception so asyncio logs no
+                # "exception was never retrieved" warning for abandoned
+                # tasks (synchronous — safe during cancellation unwinding).
+                with contextlib.suppress(Exception):
+                    get_task.exception()
 
     # ── main entrypoint ─────────────────────────────────────────────────────
 
@@ -206,7 +270,7 @@ class DownloadEngine:
     async def _attempt(self, job: DownloadJob) -> EngineResult:
         started = time.monotonic()
         job.started_at = started
-        file_path = await self.resolve_file_path(job.file_id)
+        file_path = await self.resolve_file_path(job.file_id, job=job)
         if self._local_mode and file_path.startswith("/"):
             # Local Bot API server: getFile returns an absolute path inside
             # the server's storage and there is no HTTP file endpoint —

@@ -156,7 +156,8 @@ Everything is env-driven (`.env` file supported); human-friendly values like
 | `DOWNLOAD_CONCURRENCY` | `3` | parallel download workers (1–16) |
 | `MAX_QUEUE_SIZE` | `100` | max pending jobs before rejecting |
 | `DOWNLOAD_RETRIES` | `3` | attempts per file |
-| `DOWNLOAD_TIMEOUT` | `900` | per-file hard timeout (seconds) |
+| `DOWNLOAD_TIMEOUT` | `900` | per-file hard timeout (seconds, cloud transfer) |
+| `GETFILE_TIMEOUT` | `1800` | how long `getFile` may wait while the local server fetches a big file (seconds) |
 | `CHUNK_SIZE` | `256KB` | streaming chunk size |
 | `MAX_FILE_SIZE` | `20MB` | reject bigger files (≤ 2000MB) |
 | `ALLOWED_TYPES` | *(all)* | only accept these media types |
@@ -241,6 +242,14 @@ Notes:
     - botapi-data:/var/lib/telegram-bot-api:ro
   ```
 
+- **Why the first download of a big file takes a while:** the local server
+  answers `getFile` only *after* it has fetched the whole file from Telegram
+  — the request legitimately blocks for minutes on slow links (a 2 GB file
+  at 10 Mbit/s takes ~30). The bot waits it out (up to `GETFILE_TIMEOUT`,
+  default 30 min) and stays responsive to `/cancel` in the meantime; a
+  timed-out attempt still makes progress because the server keeps
+  downloading, so the automatic retry usually returns quickly. Re-sending a
+  file that is already in the `botapi-data` volume is near-instant.
 - **Why the `botapi` service needs its custom `entrypoint`:** the Bot API
   server drops to its own unprivileged user (uid 101 in the stock image)
   and writes every received file with **owner-only permissions** — TDLib
@@ -295,6 +304,7 @@ before contributing (humans and AI assistants alike).
 | Every download fails with `404 … /file/bot…` | Old image downloaded via an HTTP file endpoint — local Bot API servers don't have one. Update to ≥ 0.1.2 and make sure the tellybee service mounts `botapi-data:/var/lib/telegram-bot-api:ro`, then `docker compose up -d --build`. |
 | `…is not mounted in this container…` in job errors | The `botapi-data` volume is not shared with the tellybee service — add `botapi-data:/var/lib/telegram-bot-api:ro` to its `volumes:` and recreate the container. |
 | Every download fails with `[Errno 13] Permission denied: '/var/lib/telegram-bot-api/…'` | The botapi server runs as its own uid (101) and writes files `0600`, so tellybee (uid 1000) can't read them from the shared volume. Copy the current `botapi` service block — especially its `entrypoint:` uid-alignment wrapper — from `docker-compose.yml.example` into your compose file, then `docker compose down && docker compose up -d --build`. On SELinux-enforcing hosts (RHEL/Fedora) also add `:z` to the `botapi-data` volume mounts. |
+| Every large first-time download fails with `HTTP Client says - Request timeout error` | Pre-0.1.4 images killed the `getFile` wait at aiogram's default 60s — but a local server legitimately takes minutes to fetch a big file before answering. Update to ≥ 0.1.4 (`git pull && docker compose up -d --build`). On very slow links raise `GETFILE_TIMEOUT` (seconds; default 1800). Already-failed files are usually cached in the `botapi-data` volume by now — re-send them, they complete near-instantly. |
 | `unable to open database file` / `not writable` | Bind mounts owned by root — the entrypoint fixes this automatically on new images; manually: `sudo chown -R 1000:1000 ./data ./downloads`, then `docker compose restart`. |
 | `BOT_TOKEN does not look like…` | Re-copy the token from @BotFather — no spaces, full string. |
 | Bot silent for non-admins | You set `ADMIN_IDS` only — add your friends via `/allow` or `ALLOWED_USER_IDS`. |

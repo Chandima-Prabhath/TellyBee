@@ -180,6 +180,20 @@ models — see `tests/test_media_types.py` for the pattern.
   file.file_path)` — honors custom API bases automatically. `getFile`
   responses are cached (`_FileCache`, TTL 15 min) because Telegram
   rate-limits that call.
+- **Local `getFile` BLOCKS until the server has downloaded the whole file.**
+  Verified against 10.3 sources: `Client::do_get_file` parks the HTTP query
+  in `file_download_listeners_` and answers it only from
+  `on_update_file(...is_downloading_completed_...)`. aiogram's session
+  default timeout is 60s (`DEFAULT_TIMEOUT`), which killed every first-time
+  download of a large file with `TelegramNetworkError: Request timeout
+  error` (0.1.4 production incident). Fix: per-request override —
+  `bot.get_file(file_id, request_timeout=round(settings.getfile_timeout))`
+  in local mode only (cloud `getFile` is a quick metadata call). The wait is
+  also raced against the job's cancel event (`_get_file`, 1s poll) so
+  `/cancel` stays responsive during multi-minute server-side downloads. A
+  timed-out attempt still makes progress server-side — the download keeps
+  running and the retry's `getFile` re-attaches as another listener — so
+  retries are useful, unlike EACCES.
 - **aiogram 3.7+ error handlers receive one `ErrorEvent`**
   (`event.update` / `event.exception`) — a `(event, exception)` signature
   crashes with `TypeError` at raise time.
