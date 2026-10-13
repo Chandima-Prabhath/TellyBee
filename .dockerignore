@@ -29,4 +29,6 @@ tests/
 Dockerfile
 docker-compose.yml
 docker-compose.override.yml
-uv.lock
+
+# NOTE: uv.lock is intentionally NOT ignored — the Dockerfile copies it
+# for reproducible `uv sync --frozen` installs.

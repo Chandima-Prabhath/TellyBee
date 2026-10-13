@@ -9,16 +9,23 @@ Human friendly formats are accepted everywhere, e.g.::
     MAX_FILE_SIZE=20MB        DOWNLOAD_CONCURRENCY=4
     ADMIN_IDS=11111111,22222222
     ALLOWED_TYPES=photo,video,document
+    ALLOWED_TYPES=["photo","video"]    (a JSON list works too)
+
+List-typed settings accept an empty value ("keep the default"), a
+comma-separated string, or a JSON array — so a bare ``ALLOWED_TYPES=``
+line in ``.env`` is valid, never a parse error.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.utils.sizes import parse_size
 
@@ -54,12 +61,36 @@ _TOKEN_RE = re.compile(r"\{([a-z_]+)\}")
 _BOT_TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{30,}$")
 
 
-def _split_csv(raw: object) -> list[str]:
-    """Turn ``"a, b ,,c"`` into ``["a","b","c"]`` (empty items dropped)."""
-    if raw in (None, "", []):
+def _parse_list(raw: object) -> list[str]:
+    """Normalize an env / kwarg value into a clean list of strings.
+
+    Accepted inputs:
+
+    * ``None`` / ``""`` / whitespace  ->  ``[]`` (keep the default)
+    * ``"a, b ,,c"``                 ->  ``["a", "b", "c"]``
+    * ``'["a","b"]'`` (JSON array)  ->  ``["a", "b"]``
+    * real lists / sets / tuples     ->  unchanged (stripped)
+
+    Env sources hand us raw strings (JSON decoding is disabled via
+    ``NoDecode``), so all tolerance has to live here.
+    """
+    if raw is None:
         return []
     if isinstance(raw, str):
-        return [item.strip() for item in raw.split(",") if item.strip()]
+        text = raw.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                loaded = json.loads(text)
+            except json.JSONDecodeError as err:
+                raise ValueError(f"invalid JSON list: {raw!r}") from err
+            if not isinstance(loaded, list):
+                raise ValueError(f"expected a JSON list, got: {raw!r}")
+            items: object = loaded
+        else:
+            items = text.split(",")
+        return [str(item).strip() for item in items if str(item).strip()]  # type: ignore[union-attr]
     if isinstance(raw, (list, set, tuple)):
         return [str(item).strip() for item in raw if str(item).strip()]
     return [str(raw)]
@@ -89,13 +120,15 @@ class Settings(BaseSettings):
     file_template: str = "{user}/{type}/{date}"
 
     # ── Access control (two tiers: admin / user) ───────────────────────────
-    admin_ids: set[int] = Field(default_factory=set)
-    allowed_user_ids: set[int] = Field(default_factory=set)
+    # ``NoDecode`` stops pydantic-settings from JSON-decoding these fields
+    # before our validators see them; empty / CSV / JSON-list all work.
+    admin_ids: Annotated[set[int], NoDecode] = Field(default_factory=set)
+    allowed_user_ids: Annotated[set[int], NoDecode] = Field(default_factory=set)
 
     # ── Media type filters (names from SUPPORTED_MEDIA_TYPES) ──────────────
     # Empty ALLOWED_TYPES means "all supported types".
-    allowed_types: set[str] = Field(default_factory=set)
-    blocked_types: set[str] = Field(default_factory=set)
+    allowed_types: Annotated[set[str], NoDecode] = Field(default_factory=set)
+    blocked_types: Annotated[set[str], NoDecode] = Field(default_factory=set)
 
     # ── Download engine ─────────────────────────────────────────────────────
     download_concurrency: int = 3
@@ -135,7 +168,7 @@ class Settings(BaseSettings):
     @classmethod
     def _parse_id_set(cls, raw: object) -> set[int]:
         ids: set[int] = set()
-        for item in _split_csv(raw):
+        for item in _parse_list(raw):
             if not item.lstrip("-").isdigit():
                 raise ValueError(f"user id must be numeric, got {item!r}")
             ids.add(int(item))
@@ -144,7 +177,7 @@ class Settings(BaseSettings):
     @field_validator("allowed_types", "blocked_types", mode="before")
     @classmethod
     def _parse_type_set(cls, raw: object) -> set[str]:
-        types = {item.lower() for item in _split_csv(raw)}
+        types = {item.lower() for item in _parse_list(raw)}
         unknown = types - set(SUPPORTED_MEDIA_TYPES)
         if unknown:
             raise ValueError(

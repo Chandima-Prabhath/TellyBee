@@ -1,8 +1,86 @@
 import pytest
+from pydantic import ValidationError
 
 from app.config import Settings
 
 VALID_TOKEN = "1234567890:AAEhBOWe4ifRhnZ2dPq1fDz0r9RYmc8V4zQ"
+
+
+# ── Env-var / .env-file sources ─────────────────────────────────────────────
+# pydantic-settings JSON-decodes complex fields before validators run unless
+# the field opts out via NoDecode. These tests pin the opt-out: empty strings,
+# CSV and JSON lists must all be accepted from real env vars / .env files
+# (docker-compose `env_file:` injects .env values as container env vars).
+
+
+def test_env_empty_values_use_defaults(monkeypatch):
+    monkeypatch.setenv("ADMIN_IDS", "")
+    monkeypatch.setenv("ALLOWED_USER_IDS", "")
+    monkeypatch.setenv("ALLOWED_TYPES", "")
+    monkeypatch.setenv("BLOCKED_TYPES", "")
+    s = Settings(bot_token=VALID_TOKEN)
+    assert s.admin_ids == set()
+    assert s.allowed_user_ids == set()
+    assert s.allowed_types == set()
+    assert s.blocked_types == set()
+    assert s.open_access is True
+
+
+def test_env_csv_values(monkeypatch):
+    monkeypatch.setenv("ADMIN_IDS", "111, 222")
+    monkeypatch.setenv("ALLOWED_TYPES", " photo , video ")
+    monkeypatch.setenv("BLOCKED_TYPES", "sticker")
+    monkeypatch.setenv("ALLOWED_USER_IDS", "333")
+    s = Settings(bot_token=VALID_TOKEN)
+    assert s.admin_ids == {111, 222}
+    assert s.allowed_types == {"photo", "video"}
+    assert s.blocked_types == {"sticker"}
+    assert s.allowed_user_ids == {333}
+    assert s.open_access is False
+
+
+def test_env_json_list_values(monkeypatch):
+    monkeypatch.setenv("ALLOWED_TYPES", '["photo","video"]')
+    monkeypatch.setenv("ALLOWED_USER_IDS", "[111, 222]")
+    monkeypatch.setenv("ADMIN_IDS", "[333]")
+    s = Settings(bot_token=VALID_TOKEN)
+    assert s.allowed_types == {"photo", "video"}
+    assert s.allowed_user_ids == {111, 222}
+    assert s.admin_ids == {333}
+
+
+def test_env_invalid_json_list_rejected(monkeypatch):
+    monkeypatch.setenv("ALLOWED_TYPES", '["photo",')
+    with pytest.raises(ValidationError):
+        Settings(bot_token=VALID_TOKEN)
+
+
+def test_dotenv_file_accepts_empty_and_csv(tmp_path, monkeypatch):
+    """The shipped .env.example (copied to .env) must parse as-is."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                f"BOT_TOKEN={VALID_TOKEN}",
+                "ADMIN_IDS=11111111",
+                "ALLOWED_USER_IDS=",
+                "ALLOWED_TYPES=",
+                "BLOCKED_TYPES=",
+                "MAX_FILE_SIZE=20MB",
+                "DOWNLOAD_CONCURRENCY=4",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    s = Settings()
+    assert s.bot_token == VALID_TOKEN
+    assert s.admin_ids == {11111111}
+    assert s.allowed_user_ids == set()
+    assert s.allowed_types == set()
+    assert s.blocked_types == set()
+    assert s.max_file_size == 20 * 1024**2
+    assert s.download_concurrency == 4
 
 
 def test_valid_settings(tmp_path):
