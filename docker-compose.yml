@@ -1,0 +1,50 @@
+services:
+  tellybee:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tellybee:latest
+    container_name: tellybee
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Inside the container files always live at these fixed paths.
+      DOWNLOAD_DIR: /app/downloads
+      DB_PATH: /app/data/tellybee.db
+    volumes:
+      - ./downloads:/app/downloads
+      - ./data:/app/data
+    ports:
+      # Health endpoint /healthz (and webhook receiver if WEBHOOK_URL is set).
+      - "8080:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ── Optional: local Bot API server for 2GB files ────────────────────────────
+# Uncomment and set API_BASE=http://botapi:8081 in .env, MAX_FILE_SIZE=2000MB
+#
+#  botapi:
+#    image: aiogram/telegram-bot-api:latest
+#    container_name: tellybee-botapi
+#    restart: unless-stopped
+#    environment:
+#      TELEGRAM_API_ID: "1234567"        # from https://my.telegram.org
+#      TELEGRAM_API_HASH: "your-api-hash"
+#      TELEGRAM_LOCAL: 1
+#    volumes:
+#      - ./botapi-data:/var/lib/telegram-bot-api
+#    ports:
+#      - "8081:8081"

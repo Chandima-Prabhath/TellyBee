@@ -1,0 +1,32 @@
+# secrets
+.env
+
+# runtime data (mount these instead)
+downloads/
+data/
+botapi-data/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# tooling / editors
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+*.md.bak
+
+# never needed inside the image
+tests/
+Dockerfile
+docker-compose.yml
+docker-compose.override.yml
+uv.lock
