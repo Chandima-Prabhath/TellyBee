@@ -50,6 +50,7 @@ the token.
 git clone https://github.com/Chandima-Prabhath/TellyBee.git
 cd TellyBee
 cp .env.example .env
+cp docker-compose.yml.example docker-compose.yml
 ```
 
 Edit `.env` — the only *required* value is `BOT_TOKEN`. Recommended:
@@ -77,6 +78,11 @@ Files land in `./downloads/`, metadata in `./data/tellybee.db`.
 > automatically (then drops back to the unprivileged `tellybee` user). If you
 > prefer to do it manually:
 > `sudo chown -R 1000:1000 ./data ./downloads`
+
+> **`docker-compose.yml` is gitignored on purpose** — you copy it once from
+> `docker-compose.yml.example`, and later `git pull` updates never overwrite
+> your local edits. To see what changed in the example:
+> `git diff HEAD -- docker-compose.yml.example`.
 
 ### 3b. Or run natively
 
@@ -206,13 +212,33 @@ Key design decisions (also documented for AI agents in `AGENT.md`):
 
 The standard Bot API caps downloads at **20 MB per file**. To lift it to
 **2000 MB**, run a local
-[telegram-bot-api](https://github.com/tdlib/telegram-bot-api) server — an
-optional service is included (commented out) in `docker-compose.yml`:
+[telegram-bot-api](https://github.com/tdlib/telegram-bot-api) server — the
+`botapi` service is **enabled by default** in `docker-compose.yml.example`
+(arm64 and amd64 images are published):
 
-1. Get `API_ID` / `API_HASH` from <https://my.telegram.org>.
-2. Uncomment the `botapi` service, fill in your credentials.
-3. In `.env`: `API_BASE=http://botapi:8081` and `MAX_FILE_SIZE=2000MB`.
-4. `docker compose up -d --build`.
+1. Get `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` from
+   <https://my.telegram.org> ("API development tools") and put both in `.env`.
+2. In `.env` set `API_BASE=http://botapi:8081` and `MAX_FILE_SIZE=2000MB`.
+3. `docker compose up -d --build`.
+
+Notes:
+
+- On startup the bot automatically performs Telegram's required one-time
+  `logOut` handshake against the cloud API — the local server will not serve
+  a bot that is still registered with the cloud. After logging out, the bot
+  cannot use the cloud API for ~10 minutes (relevant only if you switch
+  `API_BASE` back off).
+- The `botapi` container is deliberately **not** published to the host — only
+  the bot talks to it over the internal compose network. Exposing an
+  unauthenticated Bot API server would let anyone control any bot token they
+  know. Uncomment the `127.0.0.1:8081` mapping in the compose file for local
+  debugging only.
+- Telegram files are cached inside the `botapi-data` **named volume** before
+  the bot copies them to `./downloads` — a 2 GB file needs ~4 GB of free disk
+  at download time. Check usage with `docker system df`.
+- Don't want the local server? Comment out the whole `botapi` service **and**
+  the `depends_on` entry above it, remove `API_BASE` from `.env`, and set
+  `MAX_FILE_SIZE=20MB`.
 
 ---
 
@@ -234,6 +260,9 @@ before contributing (humans and AI assistants alike).
 
 | Symptom | Fix |
 |---|---|
+| `Cannot connect to host botapi:8081` / `Connect call failed` | The two containers aren't on the same network — **`docker compose restart` does not apply compose-file edits**. Run `docker compose down && docker compose up -d --build` instead. The bot retries on its own in the meantime. |
+| botapi log shows no `--api-id=` flag | Its environment didn't get your credentials — same cause as above: recreate with `docker compose up -d --build` (never `restart`). |
+| Local server answers `404 Not Found` | Missing cloud `logOut` handshake — the bot performs it automatically at startup; if it could not reach the internet, restart after a minute. |
 | `unable to open database file` / `not writable` | Bind mounts owned by root — the entrypoint fixes this automatically on new images; manually: `sudo chown -R 1000:1000 ./data ./downloads`, then `docker compose restart`. |
 | `BOT_TOKEN does not look like…` | Re-copy the token from @BotFather — no spaces, full string. |
 | Bot silent for non-admins | You set `ADMIN_IDS` only — add your friends via `/allow` or `ALLOWED_USER_IDS`. |

@@ -28,6 +28,7 @@ htmlcov/
 tests/
 Dockerfile
 docker-compose.yml
+docker-compose.yml.example
 docker-compose.override.yml
 
 # NOTE: uv.lock is intentionally NOT ignored — the Dockerfile copies it

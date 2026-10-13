@@ -1,0 +1,85 @@
+# ══════════════════════════════════════════════════════════════════════════
+#  TellyBee — docker compose example
+#
+#  Copy to docker-compose.yml — it is gitignored on purpose, so your local
+#  edits (networks, ports, resource limits, …) survive git pulls:
+#
+#      cp docker-compose.yml.example docker-compose.yml
+#
+#  Compose automatically substitutes ${TELEGRAM_API_ID} / ${TELEGRAM_API_HASH}
+#  from the .env file next to this one.
+# ══════════════════════════════════════════════════════════════════════════
+
+services:
+  tellybee:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tellybee:latest
+    container_name: tellybee
+    restart: unless-stopped
+    # Start order only (bot polling retries on its own until botapi is up).
+    depends_on:
+      - botapi
+    env_file: .env
+    environment:
+      # Inside the container files always live at these fixed paths.
+      DOWNLOAD_DIR: /app/downloads
+      DB_PATH: /app/data/tellybee.db
+    volumes:
+      - ./downloads:/app/downloads
+      - ./data:/app/data
+    ports:
+      # Health endpoint /healthz (and the webhook receiver if WEBHOOK_URL
+      # is set). Bound to localhost by default — drop the "127.0.0.1:"
+      # prefix only if you use WEBHOOK_URL so Telegram can reach it.
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Local Bot API server (unlocks downloads up to 2 GB) ────────────────────
+  # Requires in .env:
+  #   TELEGRAM_API_ID / TELEGRAM_API_HASH   (from https://my.telegram.org)
+  #   API_BASE=http://botapi:8081
+  #   MAX_FILE_SIZE=2000MB
+  #
+  # To run WITHOUT it: comment this whole service out AND the depends_on
+  # entry above, then remove API_BASE from .env and set MAX_FILE_SIZE=20MB.
+  botapi:
+    # arm64 + amd64 images (see hub.docker.com/r/aiogram/telegram-bot-api)
+    image: aiogram/telegram-bot-api:10.3
+    container_name: tellybee-botapi
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID:?Set TELEGRAM_API_ID in .env — get it at https://my.telegram.org}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH in .env — get it at https://my.telegram.org}"
+      TELEGRAM_LOCAL: 1
+    volumes:
+      # Named volume on purpose (not a bind mount): docker initializes it
+      # with the image's own ownership, so the telegram-bot-api user can
+      # write without host-side chown gymnastics. Telegram files up to 2 GB
+      # are cached here before the bot copies them to ./downloads — keep an
+      # eye on disk usage ("docker system df").
+      - botapi-data:/var/lib/telegram-bot-api
+    # Deliberately NOT published to the host: only the tellybee container
+    # needs it over the internal compose network, and an exposed Bot API
+    # server accepts any bot token it is given — a real security risk.
+    # For local debugging only, uncomment:
+    # ports:
+    #   - "127.0.0.1:8081:8081"
+
+volumes:
+  botapi-data:

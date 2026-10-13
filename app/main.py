@@ -12,12 +12,20 @@ import asyncio
 import logging
 import signal
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from aiogram.exceptions import (
+    TelegramConflictError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+    TelegramUnauthorizedError,
+)
 from aiohttp import web
 
 from app import __version__
-from app.bot_factory import build_bot, build_dispatcher, sync_bot_commands
+from app.bot_factory import build_bot, build_dispatcher, cloud_logout, sync_bot_commands
 from app.config import Settings
 from app.db import Database
 from app.logging_setup import setup_logging
@@ -51,6 +59,75 @@ async def _setup_webhook(bot, settings: Settings) -> None:
         )
     )
     logger.info("webhook registered: %s", settings.webhook_url)
+
+
+async def _poll_forever(
+    poll: Callable[[], Awaitable[None]],
+    stop: asyncio.Event,
+    *,
+    name: str = "polling",
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+) -> None:
+    """Supervise polling with automatic recovery.
+
+    aiogram's ``start_polling`` exits on the *first* transport-level failure —
+    with an unreachable Bot API server (common at container boot, since the
+    bot and the local server start in parallel) the process would otherwise
+    keep running while doing nothing at all. This supervisor restarts
+    polling with exponential backoff for transient errors and only gives up
+    on unrecoverable ones, triggering a clean process shutdown so the
+    container restarts fresh.
+    """
+    delay = base_delay
+    attempt = 0
+    while not stop.is_set():
+        attempt += 1
+        try:
+            if attempt == 1:
+                logger.info("%s: polling for updates…", name)
+            await poll()
+            logger.warning("%s: polling loop ended — shutting down", name)
+            stop.set()
+            return
+        except asyncio.CancelledError:
+            raise
+        except TelegramUnauthorizedError as err:
+            logger.critical(
+                "%s: Telegram rejected the bot token (%s). Check BOT_TOKEN in .env — "
+                "giving up.",
+                name,
+                err,
+            )
+            stop.set()
+            return
+        except TelegramConflictError as err:
+            logger.warning(
+                "%s: getUpdates conflict (%s) — another instance is polling or a "
+                "webhook is still registered; retrying in %.0fs",
+                name,
+                err,
+                delay,
+            )
+        except (TelegramRetryAfter, TelegramServerError, TelegramNetworkError, OSError) as err:
+            logger.warning(
+                "%s: Bot API server unreachable (%s: %s) — retrying in %.0fs",
+                name,
+                type(err).__name__,
+                err,
+                delay,
+            )
+        except Exception as err:  # noqa: BLE001 — unknown bug: restart cleanly
+            logger.exception("%s: unexpected polling error (%r) — shutting down", name, err)
+            stop.set()
+            return
+        # Cancellation-aware backoff sleep, then retry.
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=delay)
+            return
+        except asyncio.TimeoutError:
+            pass
+        delay = min(delay * 2.0, max_delay)
 
 
 def _ensure_writable_dir(directory: Path) -> None:
@@ -92,6 +169,14 @@ async def run() -> None:
         logger.error("BOT_TOKEN is not set. Get one from @BotFather and put it in .env")
         raise SystemExit(2)
 
+    # Telegram requires a one-time logOut from the cloud API before a local
+    # Bot API server will serve the bot (otherwise every call 404s).
+    if settings.api_base:
+        logger.info(
+            "custom Bot API server configured — running the cloud logOut handshake"
+        )
+        await cloud_logout(settings.bot_token)
+
     _ensure_writable_dir(settings.download_dir)
 
     # ── wiring ──────────────────────────────────────────────────────────────
@@ -129,15 +214,40 @@ async def run() -> None:
 
     polling_task: asyncio.Task | None = None
     if settings.polling_mode:
+        # Clear any lingering webhook from earlier experiments — otherwise
+        # Telegram answers every getUpdates with 409 Conflict.
+        from aiogram.methods import DeleteWebhook
+
+        try:
+            await bot(DeleteWebhook(drop_pending_updates=False))
+        except Exception as err:  # noqa: BLE001 — best effort
+            logger.warning("could not clear a lingering webhook: %s", err)
+
         polling_task = asyncio.create_task(
-            dp.start_polling(
-                bot,
-                handle_signals=False,
-                allowed_updates=dp.resolve_used_update_types(),
+            _poll_forever(
+                lambda: dp.start_polling(
+                    bot,
+                    handle_signals=False,
+                    allowed_updates=dp.resolve_used_update_types(),
+                ),
+                stop,
+                name="tellybee-polling",
             ),
-            name="tellybee-polling",
+            name="tellybee-polling-supervisor",
         )
-        logger.info("polling for updates…")
+
+        # Belt and suspenders: if the supervisor itself ever dies, shut the
+        # process down so the container restarts instead of idling forever.
+        def _polling_died(task: asyncio.Task) -> None:
+            if task.cancelled() or stop.is_set():
+                return
+            logger.critical(
+                "polling supervisor exited unexpectedly (%r) — shutting down",
+                task.exception(),
+            )
+            stop.set()
+
+        polling_task.add_done_callback(_polling_died)
     else:
         await _setup_webhook(bot, settings)
         logger.info("webhook mode: waiting for updates on %s", settings.webhook_path)

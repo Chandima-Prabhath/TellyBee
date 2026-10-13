@@ -2,6 +2,11 @@
 .env
 *.token
 
+# local compose copy (cp docker-compose.yml.example docker-compose.yml)
+# — gitignored so local edits survive git pulls
+docker-compose.yml
+docker-compose.override.yml
+
 # runtime data
 downloads/
 data/

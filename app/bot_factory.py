@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -20,6 +21,9 @@ from app.middleware.throttling import ThrottlingMiddleware
 from app.queue.manager import DownloadManager
 
 logger = logging.getLogger(__name__)
+
+#: The one true cloud Bot API endpoint (used for the logOut handshake).
+CLOUD_API_BASE = "https://api.telegram.org"
 
 _USER_COMMANDS = [
     BotCommand(command="start", description="Welcome & capabilities"),
@@ -39,6 +43,46 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
     BotCommand(command="resume", description="Resume the download queue"),
     BotCommand(command="health", description="Bot health snapshot"),
 ]
+
+
+async def cloud_logout(token: str, *, base: str = CLOUD_API_BASE, timeout: float = 20.0) -> bool:
+    """Log the bot out of the cloud Bot API — required before a local server serves it.
+
+    Telegram's handshake rule for local Bot API servers: the bot must call
+    ``logOut`` on ``api.telegram.org`` once, otherwise the local server
+    answers every request with 404. Safe to call on every startup — an
+    already-logged-out bot simply yields an error response that we ignore.
+
+    Never raises: this is a best-effort one-off HTTP call, not a blocker.
+    Returns True when the cloud acknowledged the logout.
+    """
+    url = f"{base.rstrip('/')}/bot{token}/logOut"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as http:
+            async with http.post(url) as resp:
+                try:
+                    payload = await resp.json(content_type=None)
+                except ValueError:
+                    payload = {}
+                if payload.get("ok"):
+                    logger.info(
+                        "cloud logOut acknowledged — the local Bot API server can now "
+                        "serve this bot (switching back to the cloud API takes ~10 minutes)"
+                    )
+                    return True
+                logger.info(
+                    "cloud logOut response: %s — fine, the bot is probably already "
+                    "logged out",
+                    payload.get("description") or f"HTTP {resp.status}",
+                )
+                return False
+    except Exception as err:  # noqa: BLE001 — never block startup on this
+        logger.warning(
+            "could not reach the cloud Bot API for the logOut handshake (%s) — "
+            "continuing; if the local server answers 404, restart after a minute",
+            err,
+        )
+        return False
 
 
 def build_bot(settings: Settings) -> Bot:
