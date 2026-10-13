@@ -1,8 +1,10 @@
-"""Regression tests for the local Bot API server mode and the 0.1.2 fixes.
+"""Regression tests for the local Bot API server mode (0.1.2 – 0.1.3).
 
 Covers:
 * engine stream-copies files from the server's shared storage (no HTTP),
 * actionable errors when the volume is not shared / file not yet present,
+* owner-only permissions on the server storage fail fast with the exact
+  uid-alignment remedy (0.1.3) instead of burning retries on EACCES,
 * the bot token is masked in errors and log output,
 * the dispatcher error handler accepts aiogram 3.31's ErrorEvent,
 * the notifier's edit throttle works (_Group slots),
@@ -140,6 +142,74 @@ async def test_local_mode_missing_file_is_retryable(settings, tmp_path, monkeypa
         await engine.run(job)
     assert "local server storage" in str(exc.value)
     assert job.attempts == 2  # settings.download_retries == 1 → 2 attempts
+
+
+# ── local mode: owner-only permissions on the server's storage ──────────────
+
+
+def test_permission_error_on_server_volume_suggests_uid_alignment(settings):
+    """EACCES inside the shared volume → the uid-alignment remedy."""
+    bot = _FakeBot(
+        VALID_TOKEN, is_local=True, file=File(file_id="f", file_unique_id="u")
+    )
+    engine = DownloadEngine(bot, settings)
+    locked = f"/var/lib/telegram-bot-api/{VALID_TOKEN}/documents/file_1.mp4"
+    err = engine._local_permission_error(PermissionError(13, "Permission denied", locked))
+
+    text = str(err)
+    assert "same uid" in text.lower()
+    assert "docker-compose.yml.example" in text
+    assert VALID_TOKEN not in text  # the token-named dir must be redacted
+
+
+def test_permission_error_in_downloads_dir_suggests_chown(settings):
+    """EACCES under the downloads dir → the classic root-owned bind mount."""
+    bot = _FakeBot(
+        VALID_TOKEN, is_local=True, file=File(file_id="f", file_unique_id="u")
+    )
+    engine = DownloadEngine(bot, settings)
+    err = engine._local_permission_error(
+        PermissionError(13, "Permission denied", "/app/downloads/movie.mp4.part")
+    )
+
+    text = str(err)
+    assert "chown" in text
+    assert "botapi" not in text
+
+
+async def test_unreadable_server_storage_fails_fast(settings, tmp_path, monkeypatch):
+    """Storage locked to a different uid → one attempt + the exact remedy.
+
+    Simulates the 0.1.2 production failure: the Bot API server writes its
+    per-bot directory (named after the token) with owner-only permissions,
+    so a differently-uided reader gets EACCES on the very first stat.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file permissions")
+
+    botapi = tmp_path / "botapi"
+    token_dir = botapi / VALID_TOKEN
+    (token_dir / "documents").mkdir(parents=True)
+    src = token_dir / "documents" / "file_0"
+    src.write_bytes(b"payload")
+
+    bot = _FakeBot(
+        VALID_TOKEN,
+        is_local=True,
+        file=File(file_id="f1", file_unique_id="u1", file_size=7, file_path=str(src)),
+    )
+    monkeypatch.setattr(DownloadEngine, "LOCAL_FILES_DIR", botapi)
+    engine = DownloadEngine(bot, settings)
+
+    token_dir.chmod(0o000)  # only a different uid's owner could traverse
+    job = _job(tmp_path, "locked.bin")
+    try:
+        with pytest.raises(DownloadError) as exc:
+            await engine.run(job)
+        assert "same uid" in str(exc.value).lower()
+        assert job.attempts == 1  # EACCES never resolves on retry — no backoff
+    finally:
+        token_dir.chmod(0o700)  # let pytest's tmp_path cleanup remove it
 
 
 # ── token redaction ─────────────────────────────────────────────────────────

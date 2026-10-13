@@ -20,8 +20,12 @@ Two transport modes:
   *absolute path* inside the server's own storage, and the server has **no
   HTTP file endpoint at all** (any ``/file/...`` request is answered with
   404). The server's data directory must therefore be shared with this
-  container — a read-only mount is enough — and we stream-copy the file
-  straight from disk, which is also much faster than going through HTTP.
+  container (read-only mount suffices) and we stream-copy the file straight
+  from disk, which is also much faster than going through HTTP. Because
+  the server writes every file with owner-only permissions (TDLib creates
+  them ``0600``) as its *own* user, it must run under the same uid as this
+  bot — the compose example wires that up — otherwise every read fails
+  with ``PermissionError``.
 """
 
 from __future__ import annotations
@@ -88,6 +92,9 @@ class DownloadEngine:
     #: mode ``getFile`` returns absolute paths inside this directory and the
     #: server exposes no HTTP file endpoint — the directory must be shared
     #: with this container (read-only mount suffices, we only ever read).
+    #: The server writes files with owner-only permissions as its own user,
+    #: so it must run under the SAME uid as this bot (1000); the compose
+    #: example's botapi entrypoint arranges exactly that.
     #: See the ``botapi-data`` volume in docker-compose.yml.example.
     LOCAL_FILES_DIR = Path("/var/lib/telegram-bot-api")
 
@@ -106,7 +113,9 @@ class DownloadEngine:
         if self._local_mode:
             if self.LOCAL_FILES_DIR.is_dir():
                 logger.info(
-                    "local Bot API mode: files are copied straight from %s",
+                    "local Bot API mode: files are read straight from %s — the "
+                    "Bot API server must run as the same uid as this bot; see "
+                    "the botapi service entrypoint in docker-compose.yml.example",
                     self.LOCAL_FILES_DIR,
                 )
             else:
@@ -201,7 +210,8 @@ class DownloadEngine:
         if self._local_mode and file_path.startswith("/"):
             # Local Bot API server: getFile returns an absolute path inside
             # the server's storage and there is no HTTP file endpoint —
-            # stream-copy the file from the (read-only) shared volume.
+            # stream-copy the file from the (read-only) shared volume. Works
+            # only when the server runs as the same uid as this process.
             return await self._copy_local_file(job, file_path, started)
         url = self.file_url(file_path)
         session = await self._session()
@@ -248,26 +258,61 @@ class DownloadEngine:
 
         The chunked read+write runs in a worker thread so large copies never
         block the event loop (and with it the bot's polling); progress and
-        cancellation are still checked between chunks like in HTTP mode. The
-        ``exists``/``stat``/``open`` probes below are sub-millisecond
-        metadata syscalls on local disk — the bulk I/O is what matters.
+        cancellation are still checked between chunks like in HTTP mode.
+
+        The server writes files as its *own* user with owner-only
+        permissions (TDLib creates them ``0600``), so this only works when
+        the server runs under the same uid as this process — the compose
+        example wires that up. A ``PermissionError`` can never be fixed by
+        retrying, so it is converted into a single actionable
+        :class:`DownloadError` instead of burning the retry budget.
         """
-        source = Path(server_path)
-        if not source.exists():  # noqa: ASYNC240 — metadata probe, see docstring
+        try:
+            return await self._copy_local_file_inner(job, server_path, started)
+        except PermissionError as err:
+            raise self._local_permission_error(err) from err
+
+    def _local_permission_error(self, err: PermissionError) -> DownloadError:
+        """Turn EACCES into an actionable, non-retryable error message."""
+        root = str(self.LOCAL_FILES_DIR)
+        filename = str(err.filename or "")
+        if filename == root or filename.startswith(root.rstrip("/") + "/"):
+            remedy = (
+                "the local Bot API server stores files with owner-only "
+                "permissions as its own user, but this bot runs as a different "
+                "one — run the botapi container as the SAME uid as tellybee "
+                "(see the botapi service entrypoint in "
+                "docker-compose.yml.example)"
+            )
+        else:
+            remedy = (
+                "this bot lacks write permission for its downloads directory — "
+                "fix ownership on the host (sudo chown -R 1000:1000 "
+                "./downloads) and restart"
+            )
+        return DownloadError(f"{self._redact(str(err))} — {remedy}")
+
+    async def _copy_local_file_inner(
+        self, job: DownloadJob, server_path: str, started: float
+    ) -> EngineResult:
+        try:
+            source_stat = Path(server_path).stat()  # noqa: ASYNC240 — metadata probe, sub-ms
+        except FileNotFoundError as err:
             if not self.LOCAL_FILES_DIR.is_dir():  # noqa: ASYNC240 — same
                 raise DownloadError(
                     f"{self.LOCAL_FILES_DIR} is not mounted in this container, but the "
                     f"local Bot API server stores files there — add "
                     f"'botapi-data:/var/lib/telegram-bot-api:ro' to the tellybee "
                     f"service volumes in docker-compose.yml and recreate the container"
-                )
+                ) from None
             # The server can still be flushing a large file to disk; let the
             # normal retry/backoff machinery handle that (FileNotFoundError
             # is an OSError, so it is retryable).
             raise FileNotFoundError(
                 f"file not (yet) present in local server storage: {server_path}"
-            )
+            ) from err
 
+        source = Path(server_path)
         target = Path(job.target_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         part_file = target.with_name(target.name + ".part")
@@ -276,7 +321,7 @@ class DownloadEngine:
         bytes_written = 0
         loop = asyncio.get_running_loop()
         try:
-            job.total_bytes = source.stat().st_size or job.file_size  # noqa: ASYNC240 — probe
+            job.total_bytes = source_stat.st_size or job.file_size
             job.bytes_done = 0
             job.speed_bps = 0.0
 

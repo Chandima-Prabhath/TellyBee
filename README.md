@@ -241,6 +241,19 @@ Notes:
     - botapi-data:/var/lib/telegram-bot-api:ro
   ```
 
+- **Why the `botapi` service needs its custom `entrypoint`:** the Bot API
+  server drops to its own unprivileged user (uid 101 in the stock image)
+  and writes every received file with **owner-only permissions** — TDLib
+  creates them `0600`. Combined with the missing HTTP file endpoint, the
+  only reader that can stream files off the shared volume is a process
+  running as the *same uid* as the server. The wrapper in
+  `docker-compose.yml.example` therefore runs the server as uid 1000 (the
+  `tellybee` user) and hands the volume over to it (`chown -R`) on every
+  start, using the server's native `--username`/`--groupname` flags. If you
+  keep your own compose file, copy the whole `botapi` service block —
+  without it every download fails with
+  `[Errno 13] Permission denied: '/var/lib/telegram-bot-api/…'`.
+
 - The `botapi` container is deliberately **not** published to the host — only
   the bot talks to it over the internal compose network. Exposing an
   unauthenticated Bot API server would let anyone control any bot token they
@@ -281,6 +294,7 @@ before contributing (humans and AI assistants alike).
 | Local server answers `404 Not Found` | Missing cloud `logOut` handshake — the bot performs it automatically at startup; if it could not reach the internet, restart after a minute. |
 | Every download fails with `404 … /file/bot…` | Old image downloaded via an HTTP file endpoint — local Bot API servers don't have one. Update to ≥ 0.1.2 and make sure the tellybee service mounts `botapi-data:/var/lib/telegram-bot-api:ro`, then `docker compose up -d --build`. |
 | `…is not mounted in this container…` in job errors | The `botapi-data` volume is not shared with the tellybee service — add `botapi-data:/var/lib/telegram-bot-api:ro` to its `volumes:` and recreate the container. |
+| Every download fails with `[Errno 13] Permission denied: '/var/lib/telegram-bot-api/…'` | The botapi server runs as its own uid (101) and writes files `0600`, so tellybee (uid 1000) can't read them from the shared volume. Copy the current `botapi` service block — especially its `entrypoint:` uid-alignment wrapper — from `docker-compose.yml.example` into your compose file, then `docker compose down && docker compose up -d --build`. On SELinux-enforcing hosts (RHEL/Fedora) also add `:z` to the `botapi-data` volume mounts. |
 | `unable to open database file` / `not writable` | Bind mounts owned by root — the entrypoint fixes this automatically on new images; manually: `sudo chown -R 1000:1000 ./data ./downloads`, then `docker compose restart`. |
 | `BOT_TOKEN does not look like…` | Re-copy the token from @BotFather — no spaces, full string. |
 | Bot silent for non-admins | You set `ADMIN_IDS` only — add your friends via `/allow` or `ALLOWED_USER_IDS`. |

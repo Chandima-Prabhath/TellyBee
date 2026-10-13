@@ -164,6 +164,18 @@ models — see `tests/test_media_types.py` for the pattern.
   path* inside the server's storage, so the engine stream-copies from the
   shared `botapi-data` volume (mounted read-only at the same path). HTTP
   fetching stays only for the cloud API.
+- **The local Bot API server writes files as its own uid with owner-only
+  permissions.** Verified against upstream sources: the server `setuid()`s
+  itself via `--username` (`td::change_user` → `getpwnam`, *names only, no
+  numeric uids*; the aiogram image hardcodes `telegram-bot-api`, uid 101)
+  and TDLib creates downloaded files `0600` (`FileFd::open` default mode).
+  tellybee runs as uid 1000, so the compose example overrides the botapi
+  `entrypoint` to register a uid-1000 user, `chown -R` the volume, and run
+  the server as the same uid (the stock entrypoint's own chown needs root,
+  its `--username` is hardcoded, and `exec $COMMAND` drops extra
+  `command:` args). Engine-side, `PermissionError` on the volume becomes a
+  non-retryable `DownloadError` carrying the uid-alignment remedy — EACCES
+  never fixes itself, never add it to the retryable set.
 - Download URL (cloud mode) = `bot.session.api.file_url(bot.token,
   file.file_path)` — honors custom API bases automatically. `getFile`
   responses are cached (`_FileCache`, TTL 15 min) because Telegram

@@ -32,8 +32,10 @@ services:
       # REQUIRED with the local Bot API server (API_BASE=http://botapi:8081):
       # in --local mode getFile returns absolute paths into the server's
       # storage and the server has NO HTTP file endpoint — tellybee reads
-      # the bytes straight from this shared, read-only volume. Remove this
-      # line only if you disabled the botapi service.
+      # the bytes straight from this shared, read-only volume. The botapi
+      # service's entrypoint runs the server as the same uid (1000) so the
+      # owner-only file permissions line up. Remove this line only if you
+      # disabled the botapi service.
       - botapi-data:/var/lib/telegram-bot-api:ro
     ports:
       # Health endpoint /healthz (and the webhook receiver if WEBHOOK_URL
@@ -69,16 +71,48 @@ services:
     image: aiogram/telegram-bot-api:10.3
     container_name: tellybee-botapi
     restart: unless-stopped
+    # ── Why the custom entrypoint? ───────────────────────────────────────
+    # The stock image starts the server as its own user (telegram-bot-api,
+    # uid 101), and the server writes every received file with OWNER-ONLY
+    # permissions (TDLib creates files 0600) under
+    # /var/lib/telegram-bot-api/<bot-token>/… — while tellybee runs as
+    # uid 1000, so reading those files off the shared volume fails with
+    # "[Errno 13] Permission denied", and the local server has no HTTP
+    # file endpoint to sidestep the filesystem.
+    #
+    # Fix: run the server as the SAME uid as tellybee. The wrapper below
+    #   1. registers a uid/gid 1000 user inside this container (the
+    #      server's --username flag resolves NAMES via getpwnam only),
+    #   2. hands the volume over to uid 1000 (chown -R — existing files
+    #      and the server's own binlogs keep working), and
+    #   3. execs the server, which setuid()s to that user itself via its
+    #      native --username/--groupname flags.
+    # TELEGRAM_API_ID / TELEGRAM_API_HASH are read from the environment by
+    # the server itself; --local unlocks 2 GB files and absolute paths.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        addgroup -g 1000 tellybee 2>/dev/null || true
+        adduser -D -H -u 1000 -G tellybee tellybee 2>/dev/null || true
+        chown -R 1000:1000 "$$TELEGRAM_WORK_DIR" "$$TELEGRAM_TEMP_DIR"
+        exec telegram-bot-api \
+          --dir="$$TELEGRAM_WORK_DIR" \
+          --temp-dir="$$TELEGRAM_TEMP_DIR" \
+          --http-port=8081 \
+          --username=tellybee \
+          --groupname=tellybee \
+          --local
     environment:
       TELEGRAM_API_ID: "${TELEGRAM_API_ID:?Set TELEGRAM_API_ID in .env — get it at https://my.telegram.org}"
       TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:?Set TELEGRAM_API_HASH in .env — get it at https://my.telegram.org}"
-      TELEGRAM_LOCAL: 1
     volumes:
       # Named volume on purpose (not a bind mount): docker initializes it
-      # with the image's own ownership, so the telegram-bot-api user can
-      # write without host-side chown gymnastics. Telegram files up to 2 GB
-      # are cached here before the bot copies them to ./downloads — keep an
-      # eye on disk usage ("docker system df").
+      # with the image's own ownership, and the entrypoint above hands it
+      # to uid 1000 on every start. Telegram files up to 2 GB are cached
+      # here before the bot copies them to ./downloads — keep an eye on
+      # disk usage ("docker system df").
       - botapi-data:/var/lib/telegram-bot-api
     # Deliberately NOT published to the host: only the tellybee container
     # needs it over the internal compose network, and an exposed Bot API
