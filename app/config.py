@@ -27,7 +27,7 @@ from typing import Annotated
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from app.utils.sizes import parse_size
+from app.utils.sizes import human_size, parse_size
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,15 @@ TEMPLATE_TOKENS: tuple[str, ...] = (
 
 _TOKEN_RE = re.compile(r"\{([a-z_]+)\}")
 _BOT_TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{30,}$")
+
+#: Absolute per-file ceiling on Telegram: premium uploads cap at 4 GB, and
+#: nothing larger exists to download. (Local Bot API servers impose NO
+#: download size limit — the 2000 MB figure in the docs is the *upload*
+#: cap; the server's download check is 20 MB and only enforced when NOT
+#: running in --local mode.)
+MAX_TELEGRAM_FILE_SIZE = 4000 * 1024 * 1024
+#: Hard download cap of the cloud Bot API.
+CLOUD_DOWNLOAD_FILE_SIZE = 20 * 1024 * 1024
 
 
 def _parse_list(raw: object) -> list[str]:
@@ -267,8 +276,25 @@ class Settings(BaseSettings):
             )
         if self.chunk_size < 8 * 1024:
             raise ValueError("CHUNK_SIZE must be at least 8KB")
-        if self.max_file_size > 2000 * 1024 * 1024:
-            raise ValueError("MAX_FILE_SIZE cannot exceed 2000MB (Telegram hard cap)")
+        # Download caps depend on the transport: a local Bot API server
+        # imposes NO download limit (anything that exists on Telegram can be
+        # fetched — 4 GB is Telegram's own per-file ceiling), while the cloud
+        # Bot API hard-caps downloads at 20 MB. Fail fast on misconfig so
+        # intake rejections match what the transport can actually deliver.
+        if self.api_base:
+            if self.max_file_size > MAX_TELEGRAM_FILE_SIZE:
+                raise ValueError(
+                    "MAX_FILE_SIZE cannot exceed 4000MB — Telegram's absolute "
+                    "per-file limit (premium uploads); downloads via a local "
+                    "Bot API server have no size limit of their own"
+                )
+        elif self.max_file_size > CLOUD_DOWNLOAD_FILE_SIZE:
+            raise ValueError(
+                f"MAX_FILE_SIZE is {human_size(self.max_file_size)}, but the cloud "
+                "Bot API only downloads files up to 20MB. Set up a local Bot API "
+                "server (see the Big files section in the README) and set "
+                "API_BASE, or lower MAX_FILE_SIZE to 20MB"
+            )
 
         # Webhook mode switch: setting WEBHOOK_URL implies webhook unless the
         # user explicitly kept POLLING_MODE=true with no webhook url.

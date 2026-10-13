@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import shutil
+from pathlib import Path
 
 from aiogram import Router
 from aiogram.filters import BaseFilter, Command, CommandObject
@@ -30,7 +33,9 @@ router.message.filter(IsAdmin())
 
 
 @router.message(Command("stats"))
-async def cmd_stats(message: Message, db: Database, manager: DownloadManager) -> None:
+async def cmd_stats(
+    message: Message, db: Database, manager: DownloadManager, settings: Settings
+) -> None:
     stats = await db.global_stats()
     totals = stats["totals"]
     lines = ["📊 <b>TellyBee stats</b>\n"]
@@ -70,7 +75,29 @@ async def cmd_stats(message: Message, db: Database, manager: DownloadManager) ->
         f"active {len(snapshot.active)} · pending {len(snapshot.pending)}"
         + (" · <b>PAUSED</b>" if snapshot.paused else "")
     )
+
+    # Disk reality check: a big file occupies roughly 2x its size across the
+    # botapi cache volume + the downloads dir, so operators need both numbers.
+    disk_parts = []
+    for label, path in (("downloads", settings.download_dir), ("botapi cache", None)):
+        target = path if path is not None else _botapi_cache_dir()
+        if target is None:
+            continue
+        try:
+            usage = await asyncio.to_thread(shutil.disk_usage, str(target))
+        except OSError:
+            continue
+        disk_parts.append(f"{label} {human_size(usage.free)} free")
+    if disk_parts:
+        lines.append(f"💾 <b>Disk</b>\n• {' · '.join(disk_parts)}")
+
     await message.answer("\n".join(lines))
+
+
+def _botapi_cache_dir():
+    """The local Bot API server's storage, when mounted in this container."""
+    cache = Path("/var/lib/telegram-bot-api")
+    return cache if cache.is_dir() else None
 
 
 @router.message(Command("users"))

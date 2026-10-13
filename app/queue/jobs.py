@@ -65,6 +65,11 @@ class DownloadJob:
     sha256: str | None = None
     avg_speed: float | None = None
     duration_ms: int | None = None
+    #: Set while the engine waits for the local Bot API server to finish
+    #: fetching the file from Telegram (the getFile call blocks for the whole
+    #: server-side download). The notifier shows a "preparing" phase instead
+    #: of a frozen 0% progress bar during that window. Monotonic timestamp.
+    waiting_since: float | None = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     # ── progress helpers ────────────────────────────────────────────────────

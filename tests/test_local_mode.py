@@ -19,6 +19,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import logging
 import os
@@ -28,7 +29,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import CommandObject
+from aiogram.methods import GetFile
 from aiogram.types import Chat, File, Message, Update, User
 
 from app.queue.engine import DownloadEngine, DownloadError, JobCancelled
@@ -336,6 +339,144 @@ async def test_cancel_during_slow_getfile_aborts_promptly(
     assert elapsed < 5.0  # detected within one poll tick, not 30s later
     assert bot.interrupted  # the in-flight getFile request was aborted
     assert not Path(job.target_path + ".part").exists()  # noqa: ASYNC240 — test assertion
+
+
+async def test_getfile_timeout_reissues_without_burning_retries(
+    settings, tmp_path, monkeypatch
+):
+    """A client-side getFile timeout means "still downloading", not failure.
+
+    The local server keeps its download progress, so the engine must simply
+    ask again — the job's retry budget stays untouched (attempts stays 1
+    even after several timeouts).
+    """
+    botapi = tmp_path / "botapi"
+    (botapi / "documents").mkdir(parents=True)
+    src = botapi / "documents" / "file_0"
+    src.write_bytes(b"payload")
+
+    class _TimeoutThenSuccessBot(_FakeBot):
+        def __init__(self, token, is_local, file, timeouts):
+            super().__init__(token, is_local, file)
+            self._timeouts = timeouts
+
+        async def get_file(self, file_id, request_timeout=None):
+            self.calls.append({"file_id": file_id, "request_timeout": request_timeout})
+            if self._timeouts > 0:
+                self._timeouts -= 1
+                raise TelegramNetworkError(
+                    method=GetFile(file_id=file_id),
+                    message="HTTP Client says - Request timeout error",
+                )
+            return self._file
+
+    bot = _TimeoutThenSuccessBot(
+        VALID_TOKEN,
+        is_local=True,
+        file=File(file_id="f1", file_unique_id="u1", file_size=7, file_path=str(src)),
+        timeouts=2,
+    )
+    monkeypatch.setattr(DownloadEngine, "LOCAL_FILES_DIR", botapi)
+    engine = DownloadEngine(bot, settings)
+
+    job = _job(tmp_path, "reissue.bin", size=7)
+    result = await engine.run(job)
+
+    assert result.bytes_written == 7
+    assert job.attempts == 1  # timeouts never burned the retry budget
+    assert len(bot.calls) == 3  # two timed-out asks + the successful one
+    assert all(c["request_timeout"] == round(settings.getfile_timeout) for c in bot.calls)
+
+
+async def test_non_timeout_network_error_still_retries(settings, tmp_path, monkeypatch):
+    """Real network errors (not 'still fetching') keep the old semantics."""
+    botapi = tmp_path / "botapi"
+    botapi.mkdir()
+    src = botapi / "documents" / "file_0"
+
+    class _ConnectionErrorBot(_FakeBot):
+        async def get_file(self, file_id, request_timeout=None):
+            self.calls.append({"file_id": file_id, "request_timeout": request_timeout})
+            raise TelegramNetworkError(
+                method=GetFile(file_id=file_id), message="Connection error"
+            )
+
+    bot = _ConnectionErrorBot(
+        VALID_TOKEN,
+        is_local=True,
+        file=File(file_id="f1", file_unique_id="u1", file_size=10, file_path=str(src)),
+    )
+    monkeypatch.setattr(DownloadEngine, "LOCAL_FILES_DIR", botapi)
+    monkeypatch.setattr(
+        DownloadEngine, "_backoff_delay", staticmethod(lambda attempt: 0.01)
+    )
+    engine = DownloadEngine(bot, settings)
+
+    job = _job(tmp_path, "connerr.bin")
+    with pytest.raises(DownloadError):
+        await engine.run(job)
+    assert job.attempts == 2  # settings.download_retries == 1 → retried
+
+
+async def test_waiting_flag_set_during_getfile_wait_and_cleared_after(
+    settings, tmp_path, monkeypatch
+):
+    """job.waiting_since drives the notifier's 'preparing' phase."""
+    botapi = tmp_path / "botapi"
+    (botapi / "documents").mkdir(parents=True)
+    src = botapi / "documents" / "file_0"
+    src.write_bytes(b"payload")
+
+    bot = _SlowFakeBot(
+        VALID_TOKEN,
+        is_local=True,
+        delay=0.3,
+        file=File(file_id="f1", file_unique_id="u1", file_size=7, file_path=str(src)),
+    )
+    monkeypatch.setattr(DownloadEngine, "LOCAL_FILES_DIR", botapi)
+    engine = DownloadEngine(bot, settings)
+
+    job = _job(tmp_path, "waiting.bin", size=7)
+    assert job.waiting_since is None
+
+    task = asyncio.ensure_future(engine.run(job))
+    await asyncio.sleep(0.15)  # mid-wait
+    assert job.waiting_since is not None
+    await task
+    assert job.waiting_since is None  # cleared again once the path resolves
+
+
+async def test_enospc_is_non_retryable_with_remedy(settings, tmp_path, monkeypatch):
+    """A full disk never fixes itself — one attempt, actionable message."""
+    botapi = tmp_path / "botapi"
+    (botapi / "documents").mkdir(parents=True)
+    src = botapi / "documents" / "file_0"
+
+    bot = _FakeBot(
+        VALID_TOKEN,
+        is_local=True,
+        file=File(file_id="f1", file_unique_id="u1", file_size=10, file_path=str(src)),
+    )
+    monkeypatch.setattr(DownloadEngine, "LOCAL_FILES_DIR", botapi)
+    engine = DownloadEngine(bot, settings)
+
+    async def _full_disk(job, server_path, started):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(engine, "_copy_local_file_inner", _full_disk)
+    job = _job(tmp_path, "big.bin")
+    with pytest.raises(DownloadError) as exc:
+        await engine.run(job)
+    assert "out of free space" in str(exc.value)
+    assert job.attempts == 1  # ENOSPC never resolves on retry — no backoff
+
+
+def test_disk_full_error_message_is_actionable():
+    err = DownloadEngine._disk_full_error(OSError(errno.ENOSPC, "No space left on device"))
+    text = str(err)
+    assert "out of free space" in text
+    assert "docker system df" in text
+    assert "DOWNLOAD_DIR" in text
 
 
 # ── token redaction ─────────────────────────────────────────────────────────

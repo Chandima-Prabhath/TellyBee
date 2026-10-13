@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -9,6 +10,7 @@ from aiogram import F, Router
 from aiogram.types import Message
 
 from app.config import Settings
+from app.db import Database
 from app.queue.manager import DownloadManager, QueueFullError, build_job
 from app.services.filenaming import ChatInfo, UserRef, resolve_destination
 from app.services.media_types import extract_media
@@ -31,6 +33,7 @@ async def receive_media(
     message: Message,
     settings: Settings,
     manager: DownloadManager,
+    db: Database | None = None,
     album: list[Message] | None = None,
 ) -> None:
     album = album if album else [message]
@@ -39,6 +42,11 @@ async def receive_media(
 
     accepted: list[tuple[Message, object]] = []
     rejections: list[tuple[str, str]] = []
+    duplicates: list[tuple[str, str]] = []  # (name, saved rel path)
+
+    # One headroom check per intake burst; decremented per accepted file so
+    # an album can't overcommit the disk either.
+    headroom = manager.disk_headroom()
 
     for msg in album:
         media = extract_media(msg)
@@ -48,7 +56,22 @@ async def receive_media(
         if reason:
             rejections.append((media.file_name or media.kind, reason))
             continue
+        if media.file_size and headroom is not None and media.file_size > headroom:
+            rejections.append(
+                (
+                    media.file_name or media.kind,
+                    f"not enough disk space — need {human_size(media.file_size)}, "
+                    f"only {human_size(max(headroom, 0))} free on the downloads volume",
+                )
+            )
+            continue
+        saved = await _already_saved(db, settings, manager, media)
+        if saved is not None:
+            duplicates.append((media.file_name or media.kind, saved))
+            continue
         accepted.append((msg, media))
+        if media.file_size and headroom is not None:
+            headroom -= media.file_size
 
     # Everything rejected → explain politely and stop.
     if accepted:
@@ -56,7 +79,11 @@ async def receive_media(
             await _reply_rejections(message, rejections, partial=True)
     else:
         await _reply_rejections(message, rejections, partial=False)
+        if duplicates:
+            await _reply_duplicates(message, duplicates)
         return
+    if duplicates:
+        await _reply_duplicates(message, duplicates)
 
     album_key = None
     if album and album[0].media_group_id:
@@ -106,6 +133,42 @@ def _filter_reason(settings: Settings, media) -> str | None:
     if media.file_size and media.file_size > settings.max_file_size:
         return f"{human_size(media.file_size)} exceeds {human_size(settings.max_file_size)} limit"
     return None
+
+
+async def _already_saved(
+    db: Database | None, settings: Settings, manager: DownloadManager, media
+) -> str | None:
+    """Rel path where this exact Telegram file was already saved, else None.
+
+    ``file_unique_id`` is stable across re-sends and forwards, so a completed
+    ledger row whose file is still on disk means a re-download would produce
+    the identical bytes — skip it with a friendly note instead. Files deleted
+    from disk fall through and get re-downloaded.
+    """
+    if not media.file_unique_id:
+        return None
+    if manager.has_file(media.file_unique_id):
+        return "(already in the queue)"
+    if db is None:
+        return None
+    row = await db.find_completed_by_unique_id(media.file_unique_id)
+    if row is None:
+        return None
+    path = settings.download_dir / row["path"]
+    try:
+        exists = await asyncio.to_thread(path.is_file)
+    except OSError:
+        return None
+    return row["path"] if exists else None
+
+
+async def _reply_duplicates(message: Message, duplicates: list[tuple[str, str]]) -> None:
+    lines = [f"♻️ <b>Already saved</b> — skipped {len(duplicates)} duplicate(s)"]
+    for name, saved in duplicates[:8]:
+        lines.append(f"• {escape(name)} → <code>{escape(saved)}</code>")
+    if len(duplicates) > 8:
+        lines.append(f"… and {len(duplicates) - 8} more")
+    await message.answer("\n".join(lines))
 
 
 async def _reply_rejections(message: Message, rejections, partial: bool) -> None:

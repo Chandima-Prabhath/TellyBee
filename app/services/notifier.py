@@ -244,6 +244,18 @@ class Notifier:
         if eta is not None and fraction is not None and fraction < 1:
             lines[-1] += f" • ETA {fmt_eta(eta)}"
 
+        # Server-side fetch phase (local Bot API mode): the engine is parked
+        # in getFile while Telegram streams the file to the local server —
+        # nothing to show but a growing elapsed counter instead of a frozen
+        # 0% bar that looks like a hang.
+        waiting = [j for j in group.jobs.values() if j.waiting_since is not None]
+        if waiting:
+            elapsed = max(time.monotonic() - j.waiting_since for j in waiting)
+            lines.append(
+                f"⏳ Telegram is preparing {plural_files(len(waiting))} — "
+                f"{fmt_eta(elapsed)} so far (first-time big downloads take a while)"
+            )
+
         if running and count == 1:
             pass  # header already carries the file name
         elif running:

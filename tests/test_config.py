@@ -160,3 +160,35 @@ def test_summary_masks_token():
     summary = s.summary()
     assert VALID_TOKEN not in summary
     assert "token=set" in summary
+
+
+# ── Mode-aware MAX_FILE_SIZE caps (0.2.0) ───────────────────────────────────
+# Local Bot API downloads have NO server-side size limit (the 20MB check is
+# only enforced when NOT in --local mode); the cloud Bot API caps at 20MB.
+
+
+def test_local_mode_allows_up_to_4gb():
+    s = Settings(bot_token=VALID_TOKEN, api_base="http://botapi:8081", max_file_size="4000MB")
+    assert s.max_file_size == 4000 * 1024**2
+
+
+def test_local_mode_rejects_above_4gb():
+    with pytest.raises(ValidationError, match="4000MB"):
+        Settings(bot_token=VALID_TOKEN, api_base="http://botapi:8081", max_file_size="4100MB")
+
+
+def test_cloud_mode_rejects_above_20mb_with_remedy():
+    with pytest.raises(ValidationError, match="API_BASE"):
+        Settings(bot_token=VALID_TOKEN, max_file_size="2000MB")
+
+
+def test_cloud_mode_accepts_20mb():
+    s = Settings(bot_token=VALID_TOKEN, max_file_size="20MB")
+    assert s.max_file_size == 20 * 1024**2
+
+
+def test_getfile_timeout_bounds():
+    with pytest.raises(ValidationError, match="GETFILE_TIMEOUT"):
+        Settings(bot_token=VALID_TOKEN, api_base="http://botapi:8081", getfile_timeout=30)
+    with pytest.raises(ValidationError, match="GETFILE_TIMEOUT"):
+        Settings(bot_token=VALID_TOKEN, api_base="http://botapi:8081", getfile_timeout=100000)

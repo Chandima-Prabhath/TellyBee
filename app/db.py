@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS downloads (
 CREATE INDEX IF NOT EXISTS idx_downloads_user_id    ON downloads (user_id);
 CREATE INDEX IF NOT EXISTS idx_downloads_status     ON downloads (status);
 CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads (created_at);
+CREATE INDEX IF NOT EXISTS idx_downloads_file_unique_id ON downloads (file_unique_id);
 """
 
 # Role cache lives here so /allow & /disallow can invalidate it centrally.
@@ -203,6 +204,25 @@ class Database:
             (status, error, sha256, avg_speed, duration_ms, finished, job_id),
         )
         await self.conn.commit()
+
+    async def find_completed_by_unique_id(self, file_unique_id: str) -> dict | None:
+        """Latest completed download of the exact same Telegram file.
+
+        ``file_unique_id`` is stable across re-sends, forwards and re-uploads
+        of the same file, which makes it the key for duplicate detection.
+        Returns None when this file has never been saved successfully.
+        """
+        async with self.conn.execute(
+            """
+            SELECT job_id, file_name, file_size, path, finished_at
+            FROM downloads
+            WHERE file_unique_id = ? AND status = 'completed'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (file_unique_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row else None
 
     async def user_history(self, user_id: int, limit: int = 10) -> list[dict]:
         async with self.conn.execute(

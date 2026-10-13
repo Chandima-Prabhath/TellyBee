@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import logging
 import random
@@ -52,6 +53,11 @@ logger = logging.getLogger(__name__)
 #: server answers getFile only after fully fetching the file from Telegram,
 #: which can take minutes — /cancel must stay responsive during that window.
 _GETFILE_CANCEL_POLL = 1.0
+#: Total wall-clock budget for one file's server-side fetch (getFile
+#: re-issues). Generous by design: a 4 GB file on a very slow link can take
+#: many hours, and re-issuing getFile does not restart the server's progress
+#: (it parks the query and answers when the download completes).
+_GETFILE_TOTAL_BUDGET = 24 * 3600.0
 
 
 class JobCancelled(Exception):
@@ -166,12 +172,14 @@ class DownloadEngine:
         """getFile with caching; retryable wrapper handles network hiccups.
 
         In local mode the Bot API server parks the request and answers only
-        AFTER it has downloaded the whole file from Telegram — minutes for a
-        first-time multi-GB file. The call therefore runs with an extended
-        per-request timeout (``GETFILE_TIMEOUT``) instead of the aiogram
-        session default of 60s, and stays responsive to ``/cancel`` while
-        waiting. A timed-out attempt still makes progress: the server keeps
-        downloading, so the next retry usually returns quickly.
+        AFTER it has downloaded the whole file from Telegram — minutes (or
+        hours for 4 GB files on slow links). Each call therefore runs with an
+        extended per-request timeout (``GETFILE_TIMEOUT``), and a *timeout*
+        does NOT burn the job's retry budget: the server keeps its download
+        progress, so the wait simply re-issues getFile until the file is ready
+        (bounded by a 24h hard cap). Real network errors still propagate to
+        the normal retry/backoff machinery, and the whole wait races the
+        job's cancel event so ``/cancel`` aborts promptly.
         """
         cached = self._cache.get(file_id)
         if cached:
@@ -179,23 +187,62 @@ class DownloadEngine:
         if self._local_mode:
             logger.info(
                 "job #%s: waiting for the local Bot API server to fetch the file "
-                "— first-time downloads of large files can take minutes "
+                "— first-time downloads of large files can take a while "
                 "(GETFILE_TIMEOUT=%ss)",
                 job.job_id if job else file_id[:12],
                 round(self._settings.getfile_timeout),
             )
-        # Cloud getFile is a quick metadata call → session default (60s).
-        # Local getFile blocks for the whole server-side download → allow
-        # minutes (seconds, int per aiogram's request_timeout contract).
-        request_timeout = (
-            round(self._settings.getfile_timeout) if self._local_mode else None
-        )
-        file = await self._get_file(file_id, job, request_timeout)
+        if job is not None:
+            job.waiting_since = time.monotonic()
+        try:
+            file = await self._get_file_with_reissue(file_id, job)
+        finally:
+            if job is not None:
+                job.waiting_since = None
         path = file.file_path
         if not path:
             raise DownloadError("getFile returned an empty file_path")
         self._cache.put(file_id, path)
         return path
+
+    async def _get_file_with_reissue(
+        self, file_id: str, job: DownloadJob | None
+    ):
+        """getFile, re-issuing on client-side timeouts (local mode only).
+
+        Cloud getFile is a quick metadata call → session default (60s), no
+        re-issues. Local getFile blocks for the whole server-side download →
+        allow minutes per call (``GETFILE_TIMEOUT``), and when the call times
+        out just ask again — the server attaches the new query to the SAME
+        in-flight download and answers it on completion.
+        """
+        deadline = (
+            time.monotonic() + _GETFILE_TOTAL_BUDGET if self._local_mode else None
+        )
+        attempt = 0
+        while True:
+            request_timeout = (
+                round(self._settings.getfile_timeout) if self._local_mode else None
+            )
+            try:
+                return await self._get_file(file_id, job, request_timeout)
+            except TelegramNetworkError as err:
+                timed_out = "timeout" in str(err).lower()
+                if (
+                    deadline is None
+                    or not timed_out
+                    or time.monotonic() >= deadline
+                ):
+                    raise  # real error, cloud mode, or out of budget → retries
+                attempt += 1
+                logger.info(
+                    "job #%s: the local Bot API server is still fetching the file "
+                    "(getFile timed out client-side after %ss, wait #%d) — asking "
+                    "again; the server keeps its download progress",
+                    job.job_id if job else file_id[:12],
+                    round(self._settings.getfile_timeout),
+                    attempt,
+                )
 
     async def _get_file(
         self, file_id: str, job: DownloadJob | None, request_timeout: int | None
@@ -309,6 +356,12 @@ class DownloadEngine:
             part_file.replace(target)
         except JobCancelled:
             raise
+        except OSError as err:
+            # ENOSPC never resolves on retry — fail fast with the remedy.
+            part_file.unlink(missing_ok=True)
+            if err.errno == errno.ENOSPC:
+                raise self._disk_full_error(err) from err
+            raise
         except BaseException:
             part_file.unlink(missing_ok=True)
             raise
@@ -329,12 +382,17 @@ class DownloadEngine:
         the server runs under the same uid as this process — the compose
         example wires that up. A ``PermissionError`` can never be fixed by
         retrying, so it is converted into a single actionable
-        :class:`DownloadError` instead of burning the retry budget.
+        :class:`DownloadError` instead of burning the retry budget. The same
+        goes for a full disk (``ENOSPC``) — retrying never frees space.
         """
         try:
             return await self._copy_local_file_inner(job, server_path, started)
         except PermissionError as err:
             raise self._local_permission_error(err) from err
+        except OSError as err:
+            if err.errno == errno.ENOSPC:
+                raise self._disk_full_error(err) from err
+            raise
 
     def _local_permission_error(self, err: PermissionError) -> DownloadError:
         """Turn EACCES into an actionable, non-retryable error message."""
@@ -355,6 +413,16 @@ class DownloadEngine:
                 "./downloads) and restart"
             )
         return DownloadError(f"{self._redact(str(err))} — {remedy}")
+
+    @staticmethod
+    def _disk_full_error(err: OSError) -> DownloadError:
+        """ENOSPC is as non-retryable as EACCES — make the remedy explicit."""
+        return DownloadError(
+            f"{err} — the downloads volume is out of free space. A file needs "
+            "roughly its own size free on the downloads disk on top of the "
+            "Bot API server's cache; free space (also check 'docker system df' "
+            "for the botapi-data volume) or move DOWNLOAD_DIR to a bigger disk"
+        )
 
     async def _copy_local_file_inner(
         self, job: DownloadJob, server_path: str, started: float

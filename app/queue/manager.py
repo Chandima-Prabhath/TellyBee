@@ -7,6 +7,7 @@ Responsibilities:
 * A live registry of active/pending jobs for the in-bot ``/queue`` monitor
   and the HTTP ``/healthz`` endpoint.
 * Pause/resume, cancel (pending or running), graceful drain on shutdown.
+* Disk headroom tracking so intake can reject files that cannot fit.
 * Durable state transitions written to SQLite (best effort — DB hiccups
   never kill a transfer).
 """
@@ -16,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import shutil
 import time
 from dataclasses import dataclass, field
 
@@ -268,6 +270,37 @@ class DownloadManager:
         return job
 
     # ── introspection ───────────────────────────────────────────────────────
+
+    def disk_headroom(self) -> int | None:
+        """Bytes still available on the downloads volume, minus queued work.
+
+        Accounts for every pending and active job's declared size so a burst
+        of submissions can't collectively overcommit the disk. Returns None
+        when the free space cannot be determined (never block intake on a
+        stat failure — the engine still fails fast on ENOSPC).
+        """
+        try:
+            free = shutil.disk_usage(str(self._settings.download_dir)).free
+        except OSError:
+            return None
+        committed = sum(
+            job.file_size or 0
+            for job in (self._pending | self._active).values()
+        )
+        return free - committed
+
+    def has_file(self, file_unique_id: str) -> bool:
+        """True when the exact same Telegram file is already queued/running.
+
+        Guards against double-submission races (the same file sent twice in
+        quick succession before either job finishes and hits the DB ledger).
+        """
+        if not file_unique_id:
+            return False
+        return any(
+            job.file_unique_id == file_unique_id
+            for job in (self._pending | self._active).values()
+        )
 
     def snapshot(self) -> QueueSnapshot:
         return QueueSnapshot(

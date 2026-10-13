@@ -188,12 +188,25 @@ models — see `tests/test_media_types.py` for the pattern.
   download of a large file with `TelegramNetworkError: Request timeout
   error` (0.1.4 production incident). Fix: per-request override —
   `bot.get_file(file_id, request_timeout=round(settings.getfile_timeout))`
-  in local mode only (cloud `getFile` is a quick metadata call). The wait is
-  also raced against the job's cancel event (`_get_file`, 1s poll) so
-  `/cancel` stays responsive during multi-minute server-side downloads. A
-  timed-out attempt still makes progress server-side — the download keeps
-  running and the retry's `getFile` re-attaches as another listener — so
-  retries are useful, unlike EACCES.
+  in local mode only (cloud `getFile` is a quick metadata call). A *timeout*
+  re-issues `getFile` (up to a 24h budget) WITHOUT burning the job's retry
+  budget — the server attaches the new query to the same in-flight
+  download. The wait is raced against the job's cancel event
+  (`_get_file`, 1s poll) so `/cancel` stays responsive, and
+  `job.waiting_since` drives the notifier's "Telegram is preparing…" phase.
+- **The 2GB figure is an UPLOAD cap, not a download cap.** Verified against
+  10.3 sources: `MAX_DOWNLOAD_FILE_SIZE = 20MB` and BOTH download-size
+  checks are guarded by `!parameters_->local_mode_` — in local mode the
+  server enforces NO download limit (the official README says exactly
+  this). The real ceiling is Telegram's own per-file maximum of 4GB
+  (Premium uploads; free users cap at 2GB). TellyBee's `MAX_FILE_SIZE`
+  validation is mode-aware accordingly: ≤ 4000MB with `API_BASE` set,
+  ≤ 20MB otherwise (fail fast on misconfig).
+- **`file_unique_id` is the duplicate-detection key** — stable across
+  re-sends, forwards and re-uploads of the same Telegram file. Intake skips
+  files whose latest completed ledger row still exists on disk (deleted
+  files re-download). "Already in the queue" comes from the manager's live
+  registry, not the DB — the ledger row is only written at submit.
 - **aiogram 3.7+ error handlers receive one `ErrorEvent`**
   (`event.update` / `event.exception`) — a `(event, exception)` signature
   crashes with `TypeError` at raise time.

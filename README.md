@@ -159,7 +159,7 @@ Everything is env-driven (`.env` file supported); human-friendly values like
 | `DOWNLOAD_TIMEOUT` | `900` | per-file hard timeout (seconds, cloud transfer) |
 | `GETFILE_TIMEOUT` | `1800` | how long `getFile` may wait while the local server fetches a big file (seconds) |
 | `CHUNK_SIZE` | `256KB` | streaming chunk size |
-| `MAX_FILE_SIZE` | `20MB` | reject bigger files (≤ 2000MB) |
+| `MAX_FILE_SIZE` | `20MB` | reject bigger files (≤ 20MB cloud · ≤ 4000MB with a local Bot API server) |
 | `ALLOWED_TYPES` | *(all)* | only accept these media types |
 | `BLOCKED_TYPES` | *(none)* | never accept these media types |
 | `PROGRESS_MIN_BYTES` | `2MB` | live progress message threshold |
@@ -209,17 +209,25 @@ Key design decisions (also documented for AI agents in `AGENT.md`):
 
 ---
 
-## 📦 Big files (up to 2 GB)
+## 📦 Big files (up to 4 GB)
 
-The standard Bot API caps downloads at **20 MB per file**. To lift it to
-**2000 MB**, run a local
-[telegram-bot-api](https://github.com/tdlib/telegram-bot-api) server — the
-`botapi` service is **enabled by default** in `docker-compose.yml.example`
+The standard Bot API caps downloads at **20 MB per file**. With a self-hosted
+[telegram-bot-api](https://github.com/tdlib/telegram-bot-api) server in
+`--local` mode, **downloads have no size limit at all** (per the server's
+own docs) — the practical ceiling is Telegram's absolute per-file maximum
+of **4 GB**, because only *Premium users can upload files larger than 2 GB*.
+You don't need any paid plan for the bot itself:
+
+* Free senders cap at 2 GB per upload — those files always work.
+* 2–4 GB files only exist on Telegram when a Premium user uploaded them;
+  **forwarding** such a file to the bot (as a free user) works fine.
+
+The `botapi` service is **enabled by default** in `docker-compose.yml.example`
 (arm64 and amd64 images are published):
 
 1. Get `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` from
    <https://my.telegram.org> ("API development tools") and put both in `.env`.
-2. In `.env` set `API_BASE=http://botapi:8081` and `MAX_FILE_SIZE=2000MB`.
+2. In `.env` set `API_BASE=http://botapi:8081` and `MAX_FILE_SIZE=4000MB`.
 3. `docker compose up -d --build`.
 
 Notes:
@@ -244,12 +252,14 @@ Notes:
 
 - **Why the first download of a big file takes a while:** the local server
   answers `getFile` only *after* it has fetched the whole file from Telegram
-  — the request legitimately blocks for minutes on slow links (a 2 GB file
-  at 10 Mbit/s takes ~30). The bot waits it out (up to `GETFILE_TIMEOUT`,
-  default 30 min) and stays responsive to `/cancel` in the meantime; a
-  timed-out attempt still makes progress because the server keeps
-  downloading, so the automatic retry usually returns quickly. Re-sending a
-  file that is already in the `botapi-data` volume is near-instant.
+  — the request legitimately blocks for minutes (a 4 GB file on a slow link
+  can take hours). The bot waits it out (`GETFILE_TIMEOUT` per request,
+  automatically re-asking for up to 24 hours) and stays responsive to
+  `/cancel` in the meantime; timeouts never burn the retry budget because
+  the server keeps its download progress. Re-sending a file that is already
+  in the `botapi-data` volume is near-instant — and since v0.2.0 re-sending
+  a file that is already in `./downloads` is skipped outright (duplicate
+  detection by `file_unique_id`).
 - **Why the `botapi` service needs its custom `entrypoint`:** the Bot API
   server drops to its own unprivileged user (uid 101 in the stock image)
   and writes every received file with **owner-only permissions** — TDLib
@@ -269,8 +279,10 @@ Notes:
   know. Uncomment the `127.0.0.1:8081` mapping in the compose file for local
   debugging only.
 - Telegram files are cached inside the `botapi-data` **named volume** before
-  the bot copies them to `./downloads` — a 2 GB file needs ~4 GB of free disk
-  at download time. Check usage with `docker system df`.
+  the bot copies them to `./downloads` — a 4 GB file needs ~8 GB of free disk
+  at download time. The bot checks free space at intake and refuses files
+  that cannot fit; `/stats` shows free space on both volumes. Check usage
+  with `docker system df`.
 - The bot token is masked (`***`) everywhere in the bot's own logs, and error
   messages shown in chat receipts never contain it — Bot API download URLs
   embed the token, so keep `docker compose logs` sharing safe too.
@@ -310,6 +322,8 @@ before contributing (humans and AI assistants alike).
 | Bot silent for non-admins | You set `ADMIN_IDS` only — add your friends via `/allow` or `ALLOWED_USER_IDS`. |
 | `ApiTokenValidationError` in logs | Token revoked/regenerated — update `.env` and restart. |
 | Files > 20 MB fail | Expected with the standard Bot API — see the *Big files* section. |
+| Files > 2 GB rejected / do bigger files work? | Yes — with the local Bot API server, downloads have **no size limit** (4 GB is Telegram's own per-file ceiling). Set `MAX_FILE_SIZE=4000MB` and `API_BASE=http://botapi:8081`. A >2 GB file can only originate from a Premium upload — forwarding one to the bot as a free user works fine. |
+| `…exceeds 4.0 GB limit` on intake | Telegram's absolute per-file maximum (Premium uploads cap at 4 GB) — nothing larger exists to download. |
 | Queue full rejections | Raise `MAX_QUEUE_SIZE` and/or `DOWNLOAD_CONCURRENCY`. |
 | Healthcheck failing | `curl http://localhost:8080/healthz` — if the bot is crash-looping, check `docker compose logs`. |
 
