@@ -23,13 +23,21 @@ RUN uv sync --frozen --no-dev
 # ── Stage 2: minimal runtime image ──────────────────────────────────────────
 FROM python:3.12-slim
 
-# Run as an unprivileged user.
+# gosu: used by the entrypoint to drop privileges after fixing bind-mount
+# ownership (docker auto-creates ./data and ./downloads as root on Linux).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+# Run the application as an unprivileged user.
 RUN groupadd --gid 1000 tellybee \
     && useradd --uid 1000 --gid tellybee --shell /bin/bash --create-home tellybee
 
 WORKDIR /app
 COPY --from=builder --chown=tellybee:tellybee /app/.venv /app/.venv
 COPY --chown=tellybee:tellybee app ./app
+COPY --chown=tellybee:tellybee docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
@@ -40,7 +48,10 @@ ENV PATH="/app/.venv/bin:$PATH" \
 RUN mkdir -p /app/downloads /app/data \
     && chown -R tellybee:tellybee /app/downloads /app/data
 
-USER tellybee
+# NOTE: no static USER directive on purpose — the entrypoint starts as root
+# only to fix ownership of bind-mounted volumes, then immediately drops to
+# the unprivileged tellybee user via gosu. Running `--user 1000:1000`
+# explicitly is also supported (entrypoint becomes a passthrough).
 
 # Health endpoint (works in both polling and webhook modes).
 EXPOSE 8080
@@ -48,4 +59,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD ["python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"]
 
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python", "-m", "app.main"]

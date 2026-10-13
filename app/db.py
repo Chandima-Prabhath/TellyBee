@@ -9,6 +9,7 @@ The queue itself lives in memory; this table is the durable record.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
@@ -69,7 +70,18 @@ class Database:
 
     async def connect(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(self._path)
+        try:
+            self._conn = await aiosqlite.connect(self._path)
+        except sqlite3.OperationalError as err:
+            # Almost always a permissions problem on the directory (classic
+            # case: docker bind mount created as root, app runs as uid 1000).
+            # Fail with an actionable message instead of a bare traceback.
+            raise RuntimeError(
+                f"cannot open SQLite database at {self._path}: {err}. "
+                "Make sure the directory exists and is writable by the bot "
+                "user. With docker bind mounts fix it once on the host: "
+                "sudo chown -R 1000:1000 ./data ./downloads"
+            ) from err
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA synchronous=NORMAL")

@@ -72,6 +72,12 @@ docker compose logs -f          # watch it come online
 
 Files land in `./downloads/`, metadata in `./data/tellybee.db`.
 
+> **Permissions:** on Linux, docker creates `./downloads/` and `./data/` as
+> root on first start. The image's entrypoint fixes their ownership
+> automatically (then drops back to the unprivileged `tellybee` user). If you
+> prefer to do it manually:
+> `sudo chown -R 1000:1000 ./data ./downloads`
+
 ### 3b. Or run natively
 
 ```bash
@@ -228,6 +234,7 @@ before contributing (humans and AI assistants alike).
 
 | Symptom | Fix |
 |---|---|
+| `unable to open database file` / `not writable` | Bind mounts owned by root — the entrypoint fixes this automatically on new images; manually: `sudo chown -R 1000:1000 ./data ./downloads`, then `docker compose restart`. |
 | `BOT_TOKEN does not look like…` | Re-copy the token from @BotFather — no spaces, full string. |
 | Bot silent for non-admins | You set `ADMIN_IDS` only — add your friends via `/allow` or `ALLOWED_USER_IDS`. |
 | `ApiTokenValidationError` in logs | Token revoked/regenerated — update `.env` and restart. |

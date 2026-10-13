@@ -12,6 +12,7 @@ import asyncio
 import logging
 import signal
 import sys
+from pathlib import Path
 
 from aiohttp import web
 
@@ -52,6 +53,29 @@ async def _setup_webhook(bot, settings: Settings) -> None:
     logger.info("webhook registered: %s", settings.webhook_url)
 
 
+def _ensure_writable_dir(directory: Path) -> None:
+    """Create *directory* and verify the bot can actually write to it.
+
+    Fails fast (SystemExit) with an actionable message instead of crashing
+    on the first download — the classic cause is a docker bind mount that
+    Docker created as root while the bot runs as uid 1000.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    probe = directory / ".tellybee-write-test"
+    try:
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+    except OSError as err:
+        logger.error(
+            "download directory %s is not writable: %s — fix ownership "
+            "(with docker bind mounts run once on the host: "
+            "sudo chown -R 1000:1000 ./downloads ./data)",
+            directory,
+            err,
+        )
+        raise SystemExit(2) from err
+
+
 async def run() -> None:
     settings = _load_settings()
     setup_logging(settings.log_level, settings.log_format)
@@ -68,7 +92,7 @@ async def run() -> None:
         logger.error("BOT_TOKEN is not set. Get one from @BotFather and put it in .env")
         raise SystemExit(2)
 
-    settings.download_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_writable_dir(settings.download_dir)
 
     # ── wiring ──────────────────────────────────────────────────────────────
     db = Database(settings.db_path)
