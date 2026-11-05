@@ -563,7 +563,10 @@ class DownloadEngine:
                 last_error = err
                 self._cleanup_part(job)
                 if attempt < attempts:
-                    delay = self._backoff_delay(attempt)
+                    delay = max(
+                        self._backoff_delay(attempt),
+                        self._retry_after_hint(err),
+                    )
                     logger.warning(
                         "job #%s attempt %d/%d failed (%s: %s); retrying in %.1fs",
                         job.job_id, attempt, attempts, type(err).__name__,
@@ -575,7 +578,7 @@ class DownloadEngine:
                         "job #%s failed after %d attempts: %s",
                         job.job_id, attempts, self._scrub(job, str(err)),
                     )
-        raise DownloadError(self._scrub(job, str(last_error or "download failed")))
+        raise DownloadError(self._failure_message(job, last_error))
 
     async def _attempt(self, job: DownloadJob) -> EngineResult:
         started = time.monotonic()
@@ -784,6 +787,45 @@ class DownloadEngine:
     def _backoff_delay(attempt: int) -> float:
         base = min(2.0**attempt, 30.0)
         return base * (0.7 + 0.6 * random.random())
+
+    @staticmethod
+    def _retry_after_hint(err: Exception) -> float:
+        """A server-asked minimum wait for rate-limit errors, else 0.
+
+        Honored (capped at 90s) when the last error is a 429/503 carrying
+        ``Retry-After`` — plain exponential backoff is often too short for
+        the very window the server just described.
+        """
+        status = getattr(err, "status", None)
+        if status not in (429, 503):
+            return 0.0
+        headers = getattr(err, "headers", None)
+        if not headers:
+            return 0.0
+        value = (headers.get("Retry-After") or "").strip()
+        if not value.isdigit():
+            return 0.0
+        return min(float(value), 90.0)
+
+    def _failure_message(self, job: DownloadJob, err: Exception | None) -> str:
+        """User-facing text for a failed job — actionable where possible.
+
+        Rate-limit failures get a plain-language explanation and remedies
+        instead of aiohttp's opaque ``429, message='expected HTTP 206…'``.
+        """
+        status = getattr(err, "status", None)
+        if status in (429, 503):
+            waited = getattr(err, "retry_after", None)
+            hint = (
+                f"the file host is rate-limiting this server (HTTP {status})"
+                + (f" and asked to retry after {waited:.0f}s" if waited else "")
+                + ". Wait a few minutes and send the link again, or set "
+                "LINK_CONNECTIONS=1 — some hosts refuse bursts of parallel "
+                "connections but allow a single steady stream (seedr-style "
+                "CDNs do this on busy free accounts)"
+            )
+            return hint
+        return self._scrub(job, str(err or "download failed"))
 
     @staticmethod
     async def _sleep_cancellable(job: DownloadJob, delay: float) -> None:

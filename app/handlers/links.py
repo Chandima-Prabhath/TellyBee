@@ -31,7 +31,7 @@ from app.queue.errors import DownloadError
 from app.queue.manager import DownloadManager, QueueFullError, build_job
 from app.services.filenaming import ChatInfo, UserRef, resolve_destination
 from app.services.media_types import MediaInfo
-from app.services.urlfetch import UrlRejected
+from app.services.urlfetch import UrlRejected, _RateLimited
 from app.utils.formatting import escape
 from app.utils.sizes import human_size
 
@@ -121,6 +121,13 @@ async def _handle_urls(
         except DownloadError as err:  # links disabled at the engine level
             rejections.append((label, str(err)))
             return
+        except _RateLimited as err:
+            waited = f" (retry after {err.retry_after:.0f}s)" if err.retry_after else ""
+            rejections.append(
+                (label, f"the host is rate-limiting us (HTTP {err.status}){waited} — "
+                 "try again in a few minutes")
+            )
+            continue
         except (TimeoutError, aiohttp.ClientError, OSError) as err:
             rejections.append((label, f"unreachable ({type(err).__name__})"))
             continue

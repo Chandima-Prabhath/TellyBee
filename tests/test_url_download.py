@@ -9,7 +9,12 @@ Covers the v0.3 /link feature end-to-end against a real aiohttp test server:
   stores the resolved address in the ``host`` field of resolver entries
   (``hostname`` holds the queried name) — the old guard read ``hostname``
   and refused EVERY hostname link with a bogus "private address" message,
-* cancellation mid-transfer and the query-string scrubbing of error text.
+* cancellation mid-transfer and the query-string scrubbing of error text,
+* rate limiting (v0.3.2): 429s are waited out with Retry-After/backoff at
+  every layer (probe, parallel parts, single stream), a throttled parallel
+  run finishes its missing bytes sequentially instead of restarting, and
+  a permanently rate-limiting host yields an actionable error that names
+  LINK_CONNECTIONS=1 instead of aiohttp's opaque 429 text.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import ipaddress
 import re
 import socket
 import time
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -530,7 +536,9 @@ async def test_ranged_multi_connection_download(settings, tmp_path, monkeypatch)
     _allow_loopback(monkeypatch)
     payload = bytes(range(256)) * ((5 * 1024 * 1024) // 256)  # 5 MB, ranged path
     peak = [0]
-    handler, app = _range_app(payload, concurrency=peak)
+    # chunk_delay simulates a real network: each part then stays alive long
+    # enough to overlap its staggered siblings (parts start 0.25s apart).
+    handler, app = _range_app(payload, concurrency=peak, chunk_delay=0.02)
     server = TestServer(app)
     await server.start_server()
     try:
@@ -628,3 +636,292 @@ def test_engine_scrubs_url_query_from_errors(settings, tmp_path):
     assert engine._scrub(tg_job, "https://host/file.zip?token=TOPSECRET").count(
         "TOPSECRET"
     ) == 1
+
+
+# ── rate limiting (v0.3.2) ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("30", 30.0),
+        ("0", 1.0),  # "now" still backs off a little
+        ("999999", 90.0),  # capped
+        ("", None),
+        ("garbage", None),
+        ("Wed, 21 Oct 2015 07:28:00 GMT", 1.0),  # past date → minimal wait
+    ],
+)
+def test_retry_after_parsing(value, expected):
+    if value == "Wed, 21 Oct 2015 07:28:00 GMT":
+        got = urlfetch._retry_after({"Retry-After": value})
+        assert got == 1.0  # past dates clamp to the 1s floor
+    else:
+        assert urlfetch._retry_after({"Retry-After": value}) == expected
+
+
+def test_retry_after_http_date_future():
+    soon = (
+        datetime.now(UTC) + timedelta(seconds=40)
+    ).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    got = urlfetch._retry_after({"Retry-After": soon})
+    assert 30.0 <= got <= 40.0
+
+
+async def test_probe_waits_out_rate_limit(settings, monkeypatch):
+    _allow_loopback(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request):
+        rng = request.headers.get("Range", "")
+        if rng == "bytes=0-0":  # the probe
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return web.Response(status=429, headers={"Retry-After": "1"})
+            return web.Response(
+                status=206,
+                headers={
+                    "Content-Range": f"bytes 0-0/{8 * 1024 * 1024}",
+                    "Accept-Ranges": "bytes",
+                },
+            )
+        return web.Response(status=416)
+
+    app = web.Application()
+    app.router.add_get("/file.bin", handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        downloader = UrlDownloader(settings)
+        probe = await downloader.probe(str(server.make_url("/file.bin")))
+        assert probe.size == 8 * 1024 * 1024
+        assert probe.accept_ranges is True
+        assert calls["n"] == 2  # refused once, waited, succeeded
+        await downloader.aclose()
+    finally:
+        await server.close()
+
+
+async def test_probe_rate_limit_budget_exhaustion_raises(settings, monkeypatch):
+    _allow_loopback(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request):
+        calls["n"] += 1
+        return web.Response(status=429, headers={"Retry-After": "3600"})
+
+    app = web.Application()
+    app.router.add_get("/file.bin", handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        downloader = UrlDownloader(settings)
+        with pytest.raises(urlfetch._RateLimited) as excinfo:
+            await downloader.probe(str(server.make_url("/file.bin")))
+        # a Retry-After beyond the patience budget fails on the FIRST refusal
+        assert calls["n"] == 1
+        assert excinfo.value.retry_after == urlfetch._RETRY_AFTER_CAP
+        await downloader.aclose()
+    finally:
+        await server.close()
+
+
+async def test_ranged_parts_wait_out_rate_limit(settings, tmp_path, monkeypatch):
+    """The reported seedr failure: 429 on the range burst, then it clears."""
+    _allow_loopback(monkeypatch)
+    payload = bytes(range(256)) * ((5 * 1024 * 1024) // 256)  # 5 MB
+    refusals_left = {"n": 4}  # one per parallel part, then the window clears
+
+    async def handler(request):
+        rng = request.headers.get("Range", "")
+        if rng == "bytes=0-0":  # probe — not rate limited
+            return web.Response(
+                status=206,
+                headers={
+                    "Content-Range": f"bytes 0-0/{len(payload)}",
+                    "Accept-Ranges": "bytes",
+                },
+            )
+        match = re.match(r"bytes=(\d+)-(\d+)", rng)
+        start = int(match.group(1))
+        end = min(int(match.group(2)), len(payload) - 1)
+        if refusals_left["n"] > 0:
+            refusals_left["n"] -= 1
+            return web.Response(status=429, headers={"Retry-After": "1"})
+        body = payload[start : end + 1]
+        return web.Response(
+            status=206,
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(len(body)),
+            },
+            body=body,
+        )
+
+    app = web.Application()
+    app.router.add_get("/file.bin", handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        engine = _engine(settings)
+        job = _url_job(tmp_path, str(server.make_url("/file.bin")), name="rl.bin",
+                       size=len(payload))
+        result = await engine.run(job)
+        assert result.bytes_written == len(payload)
+        assert result.sha256 == hashlib.sha256(payload).hexdigest()
+        assert (tmp_path / "downloads" / "rl.bin").read_bytes() == payload
+        await engine.aclose()
+    finally:
+        await server.close()
+
+
+async def test_throttled_parallel_run_finishes_sequentially(
+    settings, tmp_path, monkeypatch
+):
+    """Concurrency-limited host: max 1 stream, 429 for any 2nd connection.
+
+    The parallel phase exhausts its patience, and the missing bytes are
+    finished one connection at a time — the download still completes
+    byte-identically. (Timings patched small; production budgets are 90s.)
+    """
+    _allow_loopback(monkeypatch)
+    monkeypatch.setattr(urlfetch, "_RATE_LIMIT_DELAYS", (0.2,))
+    monkeypatch.setattr(urlfetch, "_RATE_LIMIT_BUDGET", 0.5)
+    monkeypatch.setattr(urlfetch, "_PART_START_STAGGER", 0.05)
+    monkeypatch.setattr(urlfetch, "_RATE_FALLBACK_COOLDOWN", 0.1)
+    monkeypatch.setattr(urlfetch, "_RANGED_MIN_BYTES", 1024 * 1024)
+
+    payload = bytes(range(256)) * ((2 * 1024 * 1024) // 256)  # 2 MB, 2 parts
+    stats = {"active": 0, "peak_served": 0, "refused": 0}
+
+    async def handler(request):
+        rng = request.headers.get("Range", "")
+        if rng == "bytes=0-0":  # probe — never counted, never limited
+            return web.Response(
+                status=206,
+                headers={
+                    "Content-Range": f"bytes 0-0/{len(payload)}",
+                    "Accept-Ranges": "bytes",
+                },
+            )
+        if stats["active"] >= 1:  # a 2nd concurrent stream is refused
+            stats["refused"] += 1
+            return web.Response(status=429)
+        match = re.match(r"bytes=(\d+)-(\d+)", rng)
+        start, end = int(match.group(1)), int(match.group(2))
+        end = min(end, len(payload) - 1)
+        stats["active"] += 1
+        stats["peak_served"] = max(stats["peak_served"], stats["active"])
+        try:
+            resp = web.StreamResponse(
+                status=206,
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(end - start + 1),
+                },
+            )
+            await resp.prepare(request)
+            body = payload[start : end + 1]
+            for i in range(0, len(body), 65536):
+                await asyncio.sleep(0.05)  # keep the stream busy & overlappable
+                await resp.write(body[i : i + 65536])
+            await resp.write_eof()
+            return resp
+        finally:
+            stats["active"] -= 1
+
+    app = web.Application()
+    app.router.add_get("/file.bin", handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        engine = _engine(settings)
+        job = _url_job(tmp_path, str(server.make_url("/file.bin")), name="seq.bin",
+                       size=len(payload))
+        result = await engine.run(job)
+        assert result.bytes_written == len(payload)
+        assert result.sha256 == hashlib.sha256(payload).hexdigest()
+        assert (tmp_path / "downloads" / "seq.bin").read_bytes() == payload
+        # the burst WAS refused, and no two streams were ever served at once
+        assert stats["refused"] >= 2
+        assert stats["peak_served"] == 1
+        await engine.aclose()
+    finally:
+        await server.close()
+
+
+async def test_single_stream_get_waits_out_rate_limit(
+    settings, tmp_path, monkeypatch
+):
+    _allow_loopback(monkeypatch)
+    monkeypatch.setattr(urlfetch, "_RATE_LIMIT_DELAYS", (0.2,))
+    payload = b"W" * 100_000  # < 4 MB → single-stream path
+    plain_gets = {"n": 0}
+
+    async def handler(request):
+        if request.headers.get("Range"):  # the probe
+            return web.Response(
+                status=200,
+                headers={"Content-Length": str(len(payload))},
+            )
+        plain_gets["n"] += 1
+        if plain_gets["n"] == 1:
+            return web.Response(status=429)  # no Retry-After → backoff table
+        return web.Response(
+            status=200,
+            headers={"Content-Length": str(len(payload))},
+            body=payload,
+        )
+
+    app = web.Application()
+    app.router.add_get("/file.bin", handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        engine = _engine(settings)
+        job = _url_job(tmp_path, str(server.make_url("/file.bin")), name="s.bin")
+        result = await engine.run(job)
+        assert result.bytes_written == len(payload)
+        assert (tmp_path / "downloads" / "s.bin").read_bytes() == payload
+        assert plain_gets["n"] == 2  # refused once, waited, succeeded
+        await engine.aclose()
+    finally:
+        await server.close()
+
+
+async def test_engine_reports_actionable_rate_limit_error(
+    settings, tmp_path, monkeypatch
+):
+    """A host that 429s forever fails with remedies, not aiohttp jargon."""
+    _allow_loopback(monkeypatch)
+    monkeypatch.setattr(urlfetch, "_PROBE_RATE_CAP", 0.2)
+    monkeypatch.setattr(urlfetch, "_PROBE_RATE_BUDGET", 0.5)
+
+    async def handler(request):
+        return web.Response(status=429)  # forever, no Retry-After
+
+    app = web.Application()
+    app.router.add_get("/file.bin", handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        once = Settings(
+            bot_token=VALID_TOKEN,
+            download_dir=settings.download_dir,
+            db_path=settings.db_path,
+            download_retries=0,
+        )
+        engine = _engine(once)
+        job = _url_job(tmp_path, str(server.make_url("/file.bin")))
+        with pytest.raises(DownloadError) as excinfo:
+            await engine.run(job)
+        message = str(excinfo.value)
+        assert "rate-limiting" in message
+        assert "LINK_CONNECTIONS=1" in message
+        assert "429" in message
+        assert job.attempts == 1
+        await engine.aclose()
+    finally:
+        await server.close()

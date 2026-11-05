@@ -21,7 +21,10 @@ Design goals:
   declares it), unknown sizes are enforced mid-transfer, and the queue's
   disk-headroom guard applies exactly like for Telegram files.
 * **Robust** — every ranged part resumes itself from its current offset on
-  transient errors; the outer engine retry machinery treats the whole file
+  transient errors; rate limits (429 / 503 + Retry-After) are waited out
+  with backoff that honors the server's ``Retry-After``, and a throttled
+  parallel run finishes its missing bytes over a single connection instead
+  of restarting; the outer engine retry machinery treats the whole file
   like any other download (atomic ``.part`` → rename, cancel between
   chunks, ENOSPC fails fast).
 """
@@ -39,7 +42,10 @@ import os
 import re
 import socket
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -55,12 +61,91 @@ logger = logging.getLogger(__name__)
 #: Files smaller than this never get the multi-connection treatment — the
 #: handshake overhead outweighs the parallelism.
 _RANGED_MIN_BYTES = 4 * 1024 * 1024
-#: Per-part retry delays (seconds) before the outer engine retry takes over.
+#: Per-part retry delays (seconds) for transient transport errors before
+#: the outer engine retry takes over.
 _PART_RETRY_DELAYS = (1.0, 3.0)
+#: Backoff (seconds) when the server rate-limits (429/503) without saying
+#: for how long — generous, because "come back later" is exactly what a
+#: rate limit means, and restarting the whole file via the engine retry
+#: costs far more than waiting out the window.
+_RATE_LIMIT_DELAYS = (2.0, 4.0, 8.0, 16.0, 30.0)
+#: Cumulative patience for rate-limit waits per ranged part (parallel
+#: phase) and for the whole sequential finish phase, in seconds.
+_RATE_LIMIT_BUDGET = 90.0
+#: Upper bound for honoring a single Retry-After value (some CDNs send
+#: hours; waiting that long inside a job helps nobody — /cancel exists).
+_RETRY_AFTER_CAP = 90.0
+#: Ranged parts start staggered by this much: the probe plus N
+#: simultaneous GETs is exactly the burst that per-second rate limiters
+#: refuse with 429 (seen in the wild on seedr-style CDNs). Kept small —
+#: big transfers lose nothing, and the retry machinery backstops the rest.
+_PART_START_STAGGER = 0.25
+#: Cool-down before the sequential finish phase starts (as asked by the
+#: server, capped) — its burst was just refused, after all.
+_RATE_FALLBACK_COOLDOWN = 5.0
+#: Probe-side rate-limit patience: waits capped per-wait and in total (the
+#: /link reply should not hang for minutes before the job even queues).
+_PROBE_RATE_CAP = 30.0
+_PROBE_RATE_BUDGET = 60.0
 
 
 class UrlRejected(Exception):
     """Non-retryable, user-readable rejection of a link (bad URL, HTTP 4xx…)."""
+
+
+class _RateLimited(aiohttp.ClientResponseError):
+    """429 (or 503 + Retry-After): the server asked us to slow down.
+
+    Subclasses :class:`aiohttp.ClientResponseError` so the engine's
+    transient handling (retry with backoff) still applies when one escapes
+    after our own patience ran out. ``retry_after`` carries the server's
+    asked-for delay in seconds, when it said anything at all.
+    """
+
+    def __init__(self, resp: aiohttp.ClientResponse, retry_after: float | None) -> None:
+        waited = f"; asked to retry after {retry_after:.0f}s" if retry_after else ""
+        super().__init__(
+            resp.request_info,
+            resp.history,
+            status=resp.status,
+            message=f"rate limited (HTTP {resp.status}){waited}",
+            headers=resp.headers,
+        )
+        self.retry_after = retry_after
+
+
+def _rate_limited_error(resp: aiohttp.ClientResponse) -> _RateLimited:
+    return _RateLimited(resp, _retry_after(resp.headers))
+
+
+def _is_rate_limit_status(resp: aiohttp.ClientResponse) -> bool:
+    """429 always; 503 only when the server says when to come back."""
+    return resp.status == 429 or (
+        resp.status == 503 and bool(resp.headers.get("Retry-After"))
+    )
+
+
+def _retry_after(headers: Mapping[str, str]) -> float | None:
+    """Parse ``Retry-After`` (delta-seconds or HTTP-date), clamped sanely.
+
+    Returns ``None`` when absent or unparseable. Values are clamped to
+    [1, _RETRY_AFTER_CAP]: ``Retry-After: 0`` means "now" (still back off
+    a little), and multi-hour values would park a worker for no gain.
+    """
+    value = (headers.get("Retry-After") or "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return max(1.0, min(float(value), _RETRY_AFTER_CAP))
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(1.0, min((when - datetime.now(UTC)).total_seconds(), _RETRY_AFTER_CAP))
 
 
 #: Raised by the SSRF guard inside the connector's resolver. Subclasses
@@ -369,22 +454,42 @@ class UrlDownloader:
 
         Raises :class:`UrlRejected` for unusable links; transient transport
         errors propagate as regular aiohttp/OSError exceptions so the caller
-        can retry.
+        can retry. Rate limits (429 / 503 + Retry-After) are waited out here
+        within a bounded budget — far cheaper than a whole-file engine retry.
         """
         url = validate_url(url, guard=self._guard)
         session = await self._session()
-        try:
-            async with session.get(
-                url, headers={"Range": "bytes=0-0"}, allow_redirects=True
-            ) as resp:
-                if resp.status in (403, 416):
-                    # Some servers dislike ranged probes — retry plain.
-                    resp.close()
-                    async with session.get(url, allow_redirects=True) as plain:
-                        return await self._probe_from_response(plain, url)
-                return await self._probe_from_response(resp, url)
-        except _SsrfBlockedError as err:
-            raise UrlRejected(str(err)) from err
+        rate_waited = 0.0
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                async with session.get(
+                    url, headers={"Range": "bytes=0-0"}, allow_redirects=True
+                ) as resp:
+                    if resp.status in (403, 416):
+                        # Some servers dislike ranged probes — retry plain.
+                        resp.close()
+                        async with session.get(url, allow_redirects=True) as plain:
+                            return await self._probe_from_response(plain, url)
+                    return await self._probe_from_response(resp, url)
+            except _SsrfBlockedError as err:
+                raise UrlRejected(str(err)) from err
+            except _RateLimited as err:
+                # A Retry-After that alone exceeds the whole patience budget
+                # is hopeless — fail now instead of waiting out half of it.
+                if err.retry_after and err.retry_after > _PROBE_RATE_BUDGET:
+                    raise
+                delay = err.retry_after or min(_PROBE_RATE_CAP, 5.0 * attempt)
+                delay = min(delay, _PROBE_RATE_CAP)
+                if rate_waited + delay > _PROBE_RATE_BUDGET or attempt > 10:
+                    raise
+                rate_waited += delay
+                logger.info(
+                    "probe rate limited (HTTP %d) — waiting %.0fs before trying %s again",
+                    err.status, delay, strip_query(url),
+                )
+                await asyncio.sleep(delay)
 
     async def _probe_from_response(
         self, resp: aiohttp.ClientResponse, url: str
@@ -398,7 +503,11 @@ class UrlDownloader:
             total = int(declared) if declared.isdigit() else None
             resp.close()  # never read the whole body during a probe
             ranges_ok = False
-        elif 400 <= resp.status < 500 and resp.status != 429:
+        elif _is_rate_limit_status(resp):
+            err = _rate_limited_error(resp)
+            resp.close()
+            raise err
+        elif 400 <= resp.status < 500:
             resp.close()
             raise UrlRejected(f"the server answered HTTP {resp.status}")
         else:
@@ -481,7 +590,8 @@ class UrlDownloader:
         cap = self._settings.link_max_size
         digest = hashlib.sha256()
         written = 0
-        async with session.get(probe.final_url, allow_redirects=True) as resp:
+        resp = await self._get_with_rate_patience(session, probe.final_url, job)
+        async with resp:
             await self._check_response(resp)
             declared = resp.headers.get("Content-Length", "")
             if declared.isdigit():
@@ -524,29 +634,116 @@ class UrlDownloader:
             job.job_id, human_size(size), len(bounds),
         )
         loop = asyncio.get_running_loop()
+        # Mutable per-part offsets so a throttled parallel run can finish
+        # exactly the bytes it never wrote — never restarting from zero.
+        progress = [[start] for start, _ in bounds]
         with part_file.open("w+b") as fh:
             # Preallocate so parallel pwrites land at their final offsets.
             await loop.run_in_executor(
                 None, functools.partial(os.ftruncate, fh.fileno(), size)
             )
+            rate_error: _RateLimited | None = None
             try:
                 async with asyncio.TaskGroup() as tg:
-                    for start, end in bounds:
+                    for index, (start, end) in enumerate(bounds):
                         tg.create_task(
-                            self._download_part(session, probe.final_url, start, end, fh, job)
+                            self._download_part(
+                                session, probe.final_url, start, end, fh, job,
+                                progress=progress[index],
+                                first_delay=index * _PART_START_STAGGER,
+                            )
                         )
             except* JobCancelled:
                 raise JobCancelled(job.job_id) from None
             except* UrlRejected as eg:
                 raise eg.exceptions[0] from None
+            except* _RateLimited as eg:
+                # The server throttled our parallel burst past all patience.
+                # Many CDNs that refuse bursts happily serve one steady
+                # stream — finish the missing bytes sequentially.
+                rate_error = eg.exceptions[0]
             except* OSError as eg:
                 raise eg.exceptions[0] from None
             except* (TimeoutError, aiohttp.ClientError) as eg:
                 raise eg.exceptions[0] from None
+            if rate_error is not None:
+                logger.warning(
+                    "job #%s: parallel ranges throttled (%s) — finishing the "
+                    "remaining bytes over a single connection",
+                    job.job_id, strip_query(str(rate_error)),
+                )
+                await self._sleep_cancellable(
+                    job, min(rate_error.retry_after or _RATE_FALLBACK_COOLDOWN, 30.0)
+                )
+                await self._fill_ranges_sequentially(
+                    session, job, probe.final_url, bounds, progress, fh
+                )
         # The parts arrived out of order — hash the completed file in one
         # sequential pass (in a worker thread) for the receipt/ledger.
         digest = await asyncio.to_thread(self._hash_file, part_file)
         return digest, size
+
+    async def _fill_ranges_sequentially(
+        self,
+        session: aiohttp.ClientSession,
+        job: DownloadJob,
+        url: str,
+        bounds: list[tuple[int, int]],
+        progress: list[list[int]],
+        fh: object,
+    ) -> None:
+        """Finish the byte ranges a throttled parallel run left unwritten.
+
+        One connection at a time, resuming each range from its tracked
+        offset — the gentlest pattern a rate-limited server will tolerate
+        (and the only one some per-account concurrency limits allow).
+        """
+        deadline = time.monotonic() + _RATE_LIMIT_BUDGET
+        for index, (start, end) in enumerate(bounds):
+            offset = progress[index][0]
+            if offset >= end + 1:
+                continue  # this range finished during the parallel phase
+            logger.info(
+                "job #%s: finishing range %d-%d sequentially from offset %d",
+                job.job_id, start, end, offset,
+            )
+            await self._download_part(
+                session, url, offset, end, fh, job,
+                progress=progress[index], deadline=deadline,
+            )
+
+    async def _get_with_rate_patience(
+        self, session: aiohttp.ClientSession, url: str, job: DownloadJob,
+        headers: dict[str, str] | None = None,
+    ) -> aiohttp.ClientResponse:
+        """One GET, waiting out rate limits (bounded) instead of failing.
+
+        HTTP 429 arrives as a normal response, not an exception — so this
+        checks the status, closes the body unread and sleeps as asked.
+        Returns the response UNENTERED — wrap it in ``async with``.
+        """
+        rate_waited = 0.0
+        attempt = 0
+        while True:
+            attempt += 1
+            resp = await session.get(
+                url, headers=headers or {}, allow_redirects=True
+            )
+            if not _is_rate_limit_status(resp):
+                return resp
+            err = _rate_limited_error(resp)
+            resp.close()
+            delay = err.retry_after or _RATE_LIMIT_DELAYS[
+                min(attempt - 1, len(_RATE_LIMIT_DELAYS) - 1)
+            ]
+            if rate_waited + delay > _RATE_LIMIT_BUDGET or attempt > 10:
+                raise err
+            rate_waited += delay
+            logger.info(
+                "job #%s: GET rate limited (HTTP %d) — waiting %.0fs",
+                job.job_id, err.status, delay,
+            )
+            await self._sleep_cancellable(job, delay)
 
     async def _download_part(
         self,
@@ -556,18 +753,26 @@ class UrlDownloader:
         end: int,
         fh: object,
         job: DownloadJob,
+        progress: list[int] | None = None,
+        first_delay: float = 0.0,
+        deadline: float | None = None,
     ) -> None:
         """Stream one byte range into the shared preallocated file.
 
         Retries itself from its current offset on transient errors, so one
-        flaky connection never restarts the whole file.
+        flaky connection never restarts the whole file. Rate limits are
+        waited out with backoff (honoring Retry-After) up to a budget —
+        only when that runs out does the error escape, and the caller then
+        finishes the missing bytes sequentially instead of restarting.
         """
         loop = asyncio.get_running_loop()
         offset = start
-        last_error: Exception | None = None
-        for attempt, delay in enumerate((0.0, *_PART_RETRY_DELAYS)):
-            if delay:
-                await asyncio.sleep(delay)
+        transient = 0  # index into _PART_RETRY_DELAYS
+        rate_attempt = 0
+        rate_waited = 0.0
+        if first_delay:
+            await self._sleep_cancellable(job, first_delay)
+        while True:
             try:
                 headers = {"Range": f"bytes={offset}-{end}"}
                 async with session.get(url, headers=headers) as resp:
@@ -583,26 +788,70 @@ class UrlDownloader:
                             None, functools.partial(os.pwrite, fh.fileno(), chunk, offset)  # type: ignore[attr-defined]
                         )
                         offset += len(chunk)
+                        if progress is not None:
+                            progress[0] = offset
                         job.touch_progress(len(chunk))
                 if offset < end + 1:
                     raise aiohttp.ClientPayloadError(
                         f"range {start}-{end} ended early at {offset}"
                     )
+                if progress is not None:
+                    progress[0] = offset
                 return
             except JobCancelled:
                 raise
             except _SsrfBlockedError as err:
                 raise UrlRejected(str(err)) from err
+            except _RateLimited as err:
+                if progress is not None:
+                    progress[0] = offset
+                delay = err.retry_after
+                if delay is None:
+                    delay = _RATE_LIMIT_DELAYS[
+                        min(rate_attempt, len(_RATE_LIMIT_DELAYS) - 1)
+                    ]
+                rate_attempt += 1
+                if rate_waited + delay > _RATE_LIMIT_BUDGET:
+                    raise  # patience exhausted — caller goes sequential
+                if deadline is not None and time.monotonic() + delay > deadline:
+                    raise  # the sequential phase's shared budget is spent
+                rate_waited += delay
+                logger.info(
+                    "job #%s: range %d-%d rate limited (HTTP %d) — waiting "
+                    "%.0fs (waited %.0fs so far), resuming from offset %d",
+                    job.job_id, start, end, err.status, delay, rate_waited, offset,
+                )
+                await self._sleep_cancellable(job, delay)
             except (TimeoutError, aiohttp.ClientError, OSError) as err:
-                last_error = err
+                if progress is not None:
+                    progress[0] = offset
+                if transient >= len(_PART_RETRY_DELAYS):
+                    raise
+                delay = _PART_RETRY_DELAYS[transient]
+                transient += 1
                 logger.warning(
                     "job #%s: range %d-%d attempt %d failed (%s: %s) — resuming "
                     "from offset %d",
-                    job.job_id, start, end, attempt + 1,
+                    job.job_id, start, end, transient,
                     type(err).__name__, strip_query(str(err)), offset,
                 )
-        assert last_error is not None
-        raise last_error
+                await self._sleep_cancellable(job, delay)
+
+    @staticmethod
+    async def _sleep_cancellable(job: DownloadJob, delay: float) -> None:
+        """Sleep in slices so /cancel aborts a rate-limit wait immediately.
+
+        (A plain ``asyncio.sleep(90)`` would park the job for the full
+        window even after the user hit /cancel.)
+        """
+        deadline = time.monotonic() + max(0.0, delay)
+        while True:
+            if job.is_cancelled():
+                raise JobCancelled(job.job_id)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 0.5))
 
     @staticmethod
     def _split(size: int, parts: int) -> list[tuple[int, int]]:
@@ -622,6 +871,10 @@ class UrlDownloader:
         resp: aiohttp.ClientResponse, expect_206: bool = False
     ) -> None:
         if expect_206 and resp.status != 206:
+            if _is_rate_limit_status(resp):
+                # The probe said ranges work, but the server is now telling
+                # us to slow down — wait it out, don't restart the file.
+                raise _rate_limited_error(resp)
             # The probe said ranges work — the server changed its mind
             # mid-download; surface it so the engine retries from scratch.
             raise aiohttp.ClientResponseError(
@@ -631,7 +884,9 @@ class UrlDownloader:
                 message=f"expected HTTP 206 for a range request, got {resp.status}",
                 headers=resp.headers,
             )
-        if 400 <= resp.status < 500 and resp.status != 429:
+        if _is_rate_limit_status(resp):
+            raise _rate_limited_error(resp)
+        if 400 <= resp.status < 500:
             raise UrlRejected(f"the server answered HTTP {resp.status}")
         if resp.status >= 400:
             raise aiohttp.ClientResponseError(

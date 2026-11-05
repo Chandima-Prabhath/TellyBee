@@ -366,6 +366,14 @@ not apply; the transfer runs at your host's connection speed.
   saturates the host's bandwidth where a single stream would not; servers
   without range support fall back to one stream automatically. Each ranged
   part resumes itself from its current offset on transient errors.
+- **Rate-limit aware:** hosts that answer `429` (or `503` + `Retry-After`)
+  are waited out with backoff that honors the server's `Retry-After` — at
+  the probe, per ranged part, and on single streams. If the parallel burst
+  stays throttled, the missing bytes are finished over **one connection**
+  instead of restarting the file, and parts start staggered to avoid
+  tripping per-second limits in the first place. A permanently throttling
+  host finally fails with a plain-language remedy (wait, or set
+  `LINK_CONNECTIONS=1`) instead of aiohttp's opaque `429, message=…` text.
 - **Safety:** only `http`/`https` URLs, redirects followed but re-checked,
   and an SSRF guard inside the HTTP connector **refuses to connect to
   internal addresses** (loopback, your LAN, the docker network, cloud
@@ -416,6 +424,7 @@ before contributing (humans and AI assistants alike).
 | Files > 2 GB rejected / do bigger files work? | Yes — with the local Bot API server, downloads have **no size limit** (4 GB is Telegram's own per-file ceiling). Set `MAX_FILE_SIZE=4000MB` and `API_BASE=http://botapi:8081`. A >2 GB file can only originate from a Premium upload — forwarding one to the bot as a free user works fine. |
 | Link download says *“refusing to connect: … resolves to …, a private or otherwise blocked address”* | The SSRF guard refused an internal/loopback address — by design, and the message now names it. If you trust the source (e.g. a host on your own LAN), set `LINK_SSRF_GUARD=off`. On v0.3.0 this message appeared for **every** link — aiohttp moved the resolver's address field and the guard read the wrong one; update to ≥ 0.3.1 (`git pull && docker compose up -d --build`). |
 | Link download fails with *“the server answered HTTP 404/403…”* | The server rejected the request (expired signed URL, auth required, gone). Nothing retryable — fetch a fresh link. |
+| Link download fails with *“rate-limited”* / `429` | The file host is throttling (seen with seedr-style CDNs on busy free accounts). TellyBee already waits out `Retry-After` and falls back to a single connection; if it still fails, wait a few minutes and re-send the link, or set `LINK_CONNECTIONS=1` for single-stream transfers. |
 | Progress message stuck at “Telegram is preparing…” with no % | The volume watcher could not match a growing file in the server's storage (e.g. the job's size is unknown). Display-only — the download itself is unaffected. |
 | Big files download slowly | See *Speeding up big-file downloads* — prefetching is on by default; the `botapi-fast` build multiplies single-file speed; check the host's link/disk. |
 | `…exceeds 4.0 GB limit` on intake | Telegram's absolute per-file maximum (Premium uploads cap at 4 GB) — nothing larger exists to download. Use a direct link instead. |

@@ -249,6 +249,20 @@ models — see `tests/test_media_types.py` for the pattern.
   safe to run concurrently, each resuming itself from its current offset.
   SHA-256 for ranged downloads is computed by one sequential re-read after
   the parts finish (parts arrive out of order; digests cannot be merged).
+- **Rate limits (429 / 503+Retry-After) are waited out at every layer, in
+  `urlfetch.py`** — probe loop, per ranged part (backoff honors
+  `Retry-After`, capped at 90s; cumulative budget 90s), and single-stream
+  GETs. `_RateLimited` subclasses `aiohttp.ClientResponseError`, so an
+  exhausted one still reaches the engine's transient retry (whose backoff
+  also honors `Retry-After`), and the engine's FINAL failure message for
+  429/503 is plain language with remedies instead of aiohttp's opaque text.
+  A throttled parallel run tracks per-part offsets and finishes the MISSING
+  bytes sequentially over one connection (`_fill_ranges_sequentially`) —
+  never restarts the file from zero. Parts start staggered
+  (`_PART_START_STAGGER`, 0.25s) because probe+4 simultaneous GETs is the
+  burst that per-second limiters refuse (real seedr case, v0.3.2). HTTP 429
+  arrives as a normal response, NOT an exception — check
+  `_is_rate_limit_status` after `session.get`, before reading the body.
 - **The 2GB figure is an UPLOAD cap, not a download cap.** Verified against
   10.3 sources: `MAX_DOWNLOAD_FILE_SIZE = 20MB` and BOTH download-size
   checks are guarded by `!parameters_->local_mode_` — in local mode the
