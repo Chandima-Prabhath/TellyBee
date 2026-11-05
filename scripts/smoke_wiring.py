@@ -22,6 +22,7 @@ from app.queue.engine import EngineResult
 from app.queue.manager import DownloadManager
 from app.services.filenaming import UserRef
 from app.services.notifier import Notifier
+from app.services.recovery import recover_after_reboot
 from app.web.health import create_web_app
 
 TOKEN = "1234567890:AAEhBOWe4ifRhnZ2dPq1fDz0r9RYmc8V4zQ"
@@ -61,7 +62,10 @@ class SlowStubEngine:
 
 
 async def main() -> int:
+    import shutil
+
     tmp = Path("/tmp/tellybee-smoke")
+    shutil.rmtree(tmp, ignore_errors=True)  # idempotent across repeated runs
     settings = Settings(
         bot_token=TOKEN,
         download_dir=tmp / "downloads",
@@ -78,9 +82,11 @@ async def main() -> int:
     # notifier can be exercised without real API calls.
     sent: list[str] = []
     deleted: list[tuple[int, int]] = []
+    markups: list[object] = []
 
     async def fake_send(chat_id, text, **kw):  # noqa: ANN001, ANN003
         sent.append(text)
+        markups.append(kw.get("reply_markup"))
         return SimpleNamespace(message_id=100 + len(sent))
 
     async def fake_edit(chat_id, message_id, text, **kw):  # noqa: ANN001, ANN003
@@ -104,8 +110,36 @@ async def main() -> int:
     notifier_mod._WINDOW_DEBOUNCE = 0.15
     notifier_mod._TICK = 0.05
     manager = DownloadManager(bot, db, settings, notifier=notifier, engine=SlowStubEngine())
-    dp = build_dispatcher(settings, db, manager)
+    notifier.bind_manager(manager)  # the window's inline buttons need this
+    dp = build_dispatcher(settings, db, manager, notifier=notifier)
     assert dp is not None
+
+    # 0) reboot recovery: fake a crashed session (stale running row + an
+    # orphaned .part file), then run the startup reconciliation pass
+    await db.conn.execute(
+        """
+        INSERT INTO downloads (job_id, user_id, username, chat_id, message_id,
+            album_key, media_type, file_id, file_unique_id, file_name,
+            file_size, path, status)
+        VALUES ('dead01', 111, 'smoker', 42, 1, NULL, 'document', 'f-dead',
+                'u-dead', 'dead.bin', 500, 'dead.bin', 'running')
+        """
+    )
+    await db.conn.commit()
+    orphan_part = tmp / "downloads" / "dead.bin.part"
+    orphan_part.parent.mkdir(parents=True, exist_ok=True)
+    orphan_part.write_bytes(b"half-written")
+    await recover_after_reboot(bot, settings, db)
+    assert any("interrupted" in text for text in sent), sent
+    assert any("Re-queue" in str(getattr(m, "inline_keyboard", None) or "")
+               for m in markups), "report carries the re-queue button"
+    assert not orphan_part.exists(), "orphaned .part must be swept"
+    history = await db.user_history(111)
+    assert history[0]["status"] == "interrupted", history
+    print("✓ reboot recovery: stale row marked, .part swept, report + button sent")
+    # a dispatcher with callback handlers must subscribe to callback queries
+    assert "callback_query" in dp.resolve_used_update_types()
+    print("✓ polling subscribes to callback_query updates")
 
     await manager.start()
     app = create_web_app(manager)
@@ -147,6 +181,7 @@ async def main() -> int:
     # the unified window: one live message during the job, deleted at drain;
     # the receipt is the permanent record that stays in the chat
     assert any("TellyBee" in text for text in sent), sent
+    assert any(m is not None for m in markups), "window frames carry buttons"
     assert deleted, "the window must be deleted when the queue drains"
     assert any("Saved" in text for text in sent), sent
     windows = await db.list_windows()

@@ -25,6 +25,8 @@ _STATUS_ICONS = {
     JobStatus.COMPLETED: "✅",
     JobStatus.FAILED: "❌",
     JobStatus.CANCELLED: "🚫",
+    JobStatus.INTERRUPTED: "💤",
+    JobStatus.REQUEUED: "🔁",
 }
 
 
@@ -38,6 +40,8 @@ async def cmd_start(message: Message, settings: Settings, user_role: str) -> Non
         "🎞 GIFs · 🏷 stickers · albums & media groups\n"
         "🌐 Or send a direct http(s) link — no size limit, multi-connection\n\n"
         f"Your access: <b>{who}</b>\n\n"
+        "🖥 Every download runs in one live <b>window</b> message with buttons\n"
+        "(Pause · Queue · Stats · Cancel · Help) — no commands needed.\n\n"
         "🤖 <b>Commands</b>\n"
         "/help — usage guide\n"
         "/link &lt;url&gt; — download from a direct link\n"
@@ -64,6 +68,11 @@ async def cmd_start(message: Message, settings: Settings, user_role: str) -> Non
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, settings: Settings) -> None:
+    await message.answer(help_text(settings))
+
+
+def help_text(settings: Settings) -> str:
+    """The usage guide — shared by /help and the window's Help button."""
     filters = "all supported types"
     if settings.allowed_types:
         filters = f"only: {', '.join(sorted(settings.allowed_types))}"
@@ -93,7 +102,7 @@ async def cmd_help(message: Message, settings: Settings) -> None:
         + "\n💡 Forward a whole album — it is saved as one batch with a single "
         "summary receipt."
     )
-    await message.answer(text)
+    return text
 
 
 @router.message(Command("status"))
@@ -105,7 +114,8 @@ async def cmd_status(message: Message, db, user_role: str) -> None:
     lines = ["📋 <b>Your recent downloads</b>\n"]
     for row in history:
         icon = {"completed": "✅", "failed": "❌", "cancelled": "🚫",
-                "running": "⬇️", "queued": "⏳"}.get(row["status"], "•")
+                "running": "⬇️", "queued": "⏳", "interrupted": "💤",
+                "requeued": "🔁"}.get(row["status"], "•")
         name = escape(row["file_name"] or row["media_type"])
         size = human_size(row["file_size"]) if row["file_size"] else ""
         lines.append(f"{icon} {name} {size}")

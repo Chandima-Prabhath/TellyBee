@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS downloads (
     sha256         TEXT,
     path           TEXT,
     status         TEXT NOT NULL DEFAULT 'queued'
-                   CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+                   CHECK (status IN ('queued', 'running', 'completed', 'failed',
+                                     'cancelled', 'interrupted', 'requeued')),
     error          TEXT,
     avg_speed      REAL,
     duration_ms    INTEGER,
@@ -97,7 +98,63 @@ class Database:
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(_SCHEMA)
         await self._conn.commit()
+        await self._migrate_downloads()
         logger.info("database ready at %s", self._path)
+
+    async def _migrate_downloads(self) -> None:
+        """Rebuild the downloads table when its status CHECK predates 0.4.1.
+
+        SQLite cannot ALTER a CHECK constraint, so the upgrade from the
+        old five-value list to one that also allows 'interrupted'/'requeued'
+        is the classic create-copy-drop-rename dance. Column order has been
+        stable since 0.1.0, so a positional INSERT…SELECT is safe.
+        Idempotent: fresh databases already carry the new DDL and are skipped.
+        """
+        async with self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='downloads'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None or "'interrupted'" in (row["sql"] or ""):
+            return
+        logger.info("upgrading downloads table: +interrupted/requeued statuses")
+        await self.conn.executescript(
+            """
+            BEGIN;
+            CREATE TABLE downloads_v041 (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id         TEXT NOT NULL UNIQUE,
+                user_id        INTEGER NOT NULL,
+                username       TEXT,
+                chat_id        INTEGER NOT NULL,
+                message_id     INTEGER,
+                album_key      TEXT,
+                media_type     TEXT NOT NULL,
+                file_id        TEXT NOT NULL,
+                file_unique_id TEXT,
+                file_name      TEXT,
+                file_size      INTEGER,
+                sha256         TEXT,
+                path           TEXT,
+                status         TEXT NOT NULL DEFAULT 'queued'
+                               CHECK (status IN ('queued', 'running', 'completed', 'failed',
+                                                 'cancelled', 'interrupted', 'requeued')),
+                error          TEXT,
+                avg_speed      REAL,
+                duration_ms    INTEGER,
+                created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                finished_at    TEXT
+            );
+            INSERT INTO downloads_v041 SELECT * FROM downloads;
+            DROP TABLE downloads;
+            ALTER TABLE downloads_v041 RENAME TO downloads;
+            CREATE INDEX IF NOT EXISTS idx_downloads_user_id    ON downloads (user_id);
+            CREATE INDEX IF NOT EXISTS idx_downloads_status     ON downloads (status);
+            CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads (created_at);
+            CREATE INDEX IF NOT EXISTS idx_downloads_file_unique_id ON downloads (file_unique_id);
+            COMMIT;
+            """
+        )
+        logger.info("downloads table upgraded in place (data preserved)")
 
     @property
     def conn(self) -> aiosqlite.Connection:
@@ -231,6 +288,55 @@ class Database:
         ) as cursor:
             row = await cursor.fetchone()
         return dict(row) if row else None
+
+    # ── reboot recovery ─────────────────────────────────────────────────────
+
+    async def mark_stale_downloads(self) -> int:
+        """Mark every queued/running row as interrupted; return the count.
+
+        Called exactly once at startup: the queue lives in memory, so any
+        row still 'queued'/'running' when the process boots belongs to a
+        previous life and is factually dead.
+        """
+        cursor = await self.conn.execute(
+            "UPDATE downloads SET status = 'interrupted', "
+            "error = 'interrupted by restart' "
+            "WHERE status IN ('queued', 'running')"
+        )
+        await self.conn.commit()
+        return cursor.rowcount
+
+    async def chats_with_interrupted(self) -> list[tuple[int, int]]:
+        """(chat_id, count) for every chat that lost work to a restart."""
+        async with self.conn.execute(
+            "SELECT chat_id, COUNT(*) AS n FROM downloads "
+            "WHERE status = 'interrupted' GROUP BY chat_id ORDER BY n DESC"
+        ) as cursor:
+            return [(row["chat_id"], row["n"]) for row in await cursor.fetchall()]
+
+    async def interrupted_for_chat(self, chat_id: int) -> list[dict]:
+        """Interrupted rows of one chat, oldest first (re-queue order)."""
+        async with self.conn.execute(
+            "SELECT job_id, user_id, username, chat_id, message_id, album_key, "
+            "media_type, file_id, file_unique_id, file_name, file_size, path "
+            "FROM downloads WHERE chat_id = ? AND status = 'interrupted' "
+            "ORDER BY id",
+            (chat_id,),
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def mark_requeued(self, job_ids: list[str]) -> int:
+        """Flag interrupted rows as re-queued (the button worked)."""
+        if not job_ids:
+            return 0
+        placeholders = ",".join("?" * len(job_ids))
+        cursor = await self.conn.execute(
+            f"UPDATE downloads SET status = 'requeued' "
+            f"WHERE job_id IN ({placeholders}) AND status = 'interrupted'",
+            job_ids,
+        )
+        await self.conn.commit()
+        return cursor.rowcount
 
     # ── progress windows (crash cleanup only) ────────────────────────────────
 

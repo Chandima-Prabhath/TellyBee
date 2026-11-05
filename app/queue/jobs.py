@@ -22,6 +22,11 @@ class JobStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    #: Set at startup for jobs whose process died before finishing — the
+    #: queue lives in memory, so a reboot loses everything not yet done.
+    INTERRUPTED = "interrupted"
+    #: An interrupted job that was put back into the queue (Re-queue button).
+    REQUEUED = "requeued"
 
 
 @dataclass(slots=True)

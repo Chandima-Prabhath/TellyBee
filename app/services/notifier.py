@@ -32,6 +32,7 @@ import time
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.config import Settings
 from app.queue.jobs import DownloadJob, JobStatus
@@ -57,6 +58,9 @@ _RECEIPT_MAX_WAIT = 15.0
 _WINDOW_FLOOD_PARK = 30.0
 #: How many active entries (job or collapsed album) get detailed lines.
 _MAX_ACTIVE_ENTRIES = 6
+
+#: Callback payload prefix shared by every window button (see handlers/callbacks.py).
+_CB = "tb:"
 
 _TYPE_ICONS = {
     "photo": "🖼",
@@ -133,10 +137,33 @@ class Notifier:
         self._db = db
         self._groups: dict[str, _Group] = {}
         self._windows: dict[int, _Window] = {}
+        # The queue manager, bound after construction (main.py) — used only
+        # to reflect the paused state in the window's button row. Duck-typed
+        # on purpose: no import, no cycle.
+        self._manager = None
         # Global pacing for window edits (see _EDIT_MIN_GAP): one edit in
         # flight at a time, routine refreshes dropped rather than queued.
         self._edit_lock = asyncio.Lock()
         self._next_edit_at = 0.0
+
+    def bind_manager(self, manager) -> None:
+        """Give the notifier a peek at queue state (paused flag) for buttons."""
+        self._manager = manager
+
+    def request_refresh(self, chat_id: int | None = None) -> None:
+        """Reset the edit throttle so the next tick re-renders immediately.
+
+        Called by the window buttons after a state change (pause/resume):
+        the new button labels and the header's paused marker then appear
+        within one updater tick instead of after the full edit interval.
+        """
+        windows = (
+            [self._windows[chat_id]] if chat_id is not None and chat_id in self._windows
+            else list(self._windows.values())
+        )
+        for window in windows:
+            window._last_edit = 0.0
+            self._ensure_updater(window)
 
     # ── lifecycle ───────────────────────────────────────────────────────────
 
@@ -275,7 +302,9 @@ class Notifier:
 
         text = self._window_text(window)
         try:
-            message = await self._bot.send_message(window.chat_id, text)
+            message = await self._bot.send_message(
+                window.chat_id, text, reply_markup=self._keyboard(window)
+            )
         except TelegramRetryAfter as err:
             # No sleeping the updater away: park the next attempt beyond
             # the announced window (bounded) and try again then.
@@ -313,6 +342,7 @@ class Notifier:
                     self._window_text(window),
                     chat_id=window.chat_id,
                     message_id=window.message_id,
+                    reply_markup=self._keyboard(window),
                 )
             except TelegramBadRequest as err:
                 message = str(err).lower()
@@ -402,6 +432,39 @@ class Notifier:
                 return False
         return False
 
+    # ── window keyboard ─────────────────────────────────────────────────────
+
+    def _keyboard(self, window: _Window) -> InlineKeyboardMarkup | None:
+        """The window's remote-control row (None when no manager is bound).
+
+        The same buttons ride along on every send AND every edit — an
+        edit_message_text without ``reply_markup`` would strip them. The
+        pause/resume button reflects the queue's live state, so the header
+        text also carries a paused marker (an identical text + identical
+        markup would trip Telegram's "message is not modified").
+        """
+        manager = self._manager
+        if manager is None:
+            return None
+        paused = bool(getattr(manager, "paused", False))
+        row1 = [
+            InlineKeyboardButton(
+                text="▶️ Resume" if paused else "⏸ Pause",
+                callback_data=_CB + ("resume" if paused else "pause"),
+            ),
+            InlineKeyboardButton(text="📋 Queue", callback_data=_CB + "queue"),
+            InlineKeyboardButton(text="📊 Stats", callback_data=_CB + "stats"),
+        ]
+        rows = [row1]
+        if window.live:
+            rows.append([
+                InlineKeyboardButton(text="✖️ Cancel", callback_data=_CB + "cancel"),
+                InlineKeyboardButton(text="❓ Help", callback_data=_CB + "help"),
+            ])
+        else:
+            rows.append([InlineKeyboardButton(text="❓ Help", callback_data=_CB + "help")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
     # ── text builders ───────────────────────────────────────────────────────
 
     @staticmethod
@@ -432,6 +495,8 @@ class Notifier:
         if window.cancelled:
             parts.append(f"{window.cancelled} cancelled")
         header = "🐝 <b>TellyBee</b>"
+        if self._manager is not None and getattr(self._manager, "paused", False):
+            header += " · <b>⏸ paused</b>"
         if parts:
             header += f" — {' · '.join(parts)}"
         volume = sum((j.total_bytes or j.file_size or 0) for j in live)

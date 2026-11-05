@@ -18,6 +18,11 @@ services:
     image: tellybee:latest
     container_name: tellybee
     restart: unless-stopped
+    # The bot's graceful drain allows running downloads up to 25s to finish
+    # (docker compose down / up --build send SIGTERM first). Docker's default
+    # stop grace is only 10s, which SIGKILLs a busy bot mid-drain — 40s lets
+    # the drain complete AND leaves headroom for slow chunk writes.
+    stop_grace_period: 40s
     # Start order only (bot polling retries on its own until botapi is up).
     depends_on:
       - botapi

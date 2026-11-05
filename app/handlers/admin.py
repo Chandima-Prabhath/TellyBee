@@ -36,6 +36,11 @@ router.message.filter(IsAdmin())
 async def cmd_stats(
     message: Message, db: Database, manager: DownloadManager, settings: Settings
 ) -> None:
+    await message.answer(await stats_text(db, manager, settings))
+
+
+async def stats_text(db: Database, manager: DownloadManager, settings: Settings) -> str:
+    """The full statistics block — shared by /stats and the Stats button."""
     stats = await db.global_stats()
     totals = stats["totals"]
     lines = ["📊 <b>TellyBee stats</b>\n"]
@@ -91,7 +96,7 @@ async def cmd_stats(
     if disk_parts:
         lines.append(f"💾 <b>Disk</b>\n• {' · '.join(disk_parts)}")
 
-    await message.answer("\n".join(lines))
+    return "\n".join(lines)
 
 
 def _botapi_cache_dir():

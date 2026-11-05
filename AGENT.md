@@ -359,3 +359,43 @@ models — see `tests/test_media_types.py` for the pattern.
 3. README table / AGENT.md updated if behavior or config surface changed.
 4. `.env.example` updated for any new setting.
 5. No secrets, tokens, or user file names in logs.
+- **aiogram models are FROZEN pydantic models** (`model_config.frozen=True`)
+  — you cannot monkey-patch `callback.answer` / `callback.bot` on a real
+  `CallbackQuery` in tests; build plain fake objects with the attributes
+  the handler touches, or bind via `obj.as_(bot)` for the private `_bot`
+  attr. `CallbackQuery` also requires the `chat_instance` field when
+  constructed directly.
+- **Every callback handler MUST call `answer_callback_query`** — an
+  unanswered inline button spins in the client until it times out. The
+  callbacks router wraps all actions in try/except and answers even on
+  failure; keep that pattern when adding buttons.
+- **Callback queries bypass the message auth middleware** (it only wraps
+  `dp.message`). Role resolution for buttons lives in
+  `handlers/callbacks._resolve_role` and must mirror `AuthMiddleware`
+  exactly: admin_ids env → DB role → allowed_user_ids env → open access.
+- **`allowed_updates` must include `"callback_query"`** in webhook mode
+  (polling uses `dp.resolve_used_update_types()` and picks it up
+  automatically once a callback handler exists) — else buttons are dead.
+- **`edit_message_text` without `reply_markup` STRIPS the keyboard** — the
+  window's button row must be passed on EVERY send and EVERY edit, not just
+  the initial one (`Notifier._keyboard`).
+- **SQLite cannot ALTER a CHECK constraint** — extending the `downloads`
+  status enum means the create-copy-drop-rename dance
+  (`Database._migrate_downloads`), guarded by sniffing `sqlite_master.sql`
+  for `'interrupted'` so it is idempotent. Column order has been stable
+  since 0.1.0, making the positional `INSERT … SELECT` safe — do not
+  reorder columns in `_SCHEMA`.
+- **`db.get_role()` is backed by a process-wide `_role_cache` keyed by
+  user id** — tests that create multiple databases must call
+  `Database.invalidate_role_cache()` or roles leak across test databases
+  (first observed in test_callbacks.py).
+- **Reboot recovery runs BEFORE polling starts** (`main.run()` calls
+  `recover_after_reboot` right after `manager.start()`): stale
+  queued/running rows → `interrupted`, `*.part` orphans swept (a `.part` at
+  boot is by definition abandoned — no worker exists yet), one report per
+  chat with the Re-queue button. The button rebuilds jobs from ledger
+  columns (`file_id`, `file_unique_id`, `path`, `album_key`) — those
+  columns ARE the recovery contract; don't drop them from `insert_download`.
+  A graceful shutdown marks pending jobs `cancelled` with receipts instead;
+  the compose example's `stop_grace_period: 40s` gives the 25 s drain time
+  to actually finish (docker's default is 10 s).

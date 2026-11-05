@@ -106,8 +106,13 @@ def build_bot(settings: Settings) -> Bot:
     )
 
 
-def build_dispatcher(settings: Settings, db: Database, manager: DownloadManager) -> Dispatcher:
-    dp = Dispatcher(settings=settings, db=db, manager=manager)
+def build_dispatcher(
+    settings: Settings,
+    db: Database,
+    manager: DownloadManager,
+    notifier=None,
+) -> Dispatcher:
+    dp = Dispatcher(settings=settings, db=db, manager=manager, notifier=notifier)
     dp.include_router(build_router())
 
     # Outer middleware order = execution order:

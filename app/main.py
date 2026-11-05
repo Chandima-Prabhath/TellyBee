@@ -31,6 +31,7 @@ from app.db import Database
 from app.logging_setup import setup_logging
 from app.queue.manager import DownloadManager
 from app.services.notifier import Notifier
+from app.services.recovery import recover_after_reboot
 from app.web.health import attach_webhook, create_web_app
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,9 @@ async def _setup_webhook(bot, settings: Settings) -> None:
             url=settings.webhook_url,
             secret_token=settings.webhook_secret or None,
             drop_pending_updates=False,
-            allowed_updates=["message"],
+            # Message AND callback-query updates: the progress window's
+            # inline buttons arrive as callback_query updates.
+            allowed_updates=["message", "callback_query"],
         )
     )
     logger.info("webhook registered: %s", settings.webhook_url)
@@ -188,9 +191,16 @@ async def run() -> None:
     notifier = Notifier(bot, settings, db=db)
     await notifier.startup()  # delete progress windows orphaned by a crash
     manager = DownloadManager(bot, db, settings, notifier=notifier)
-    dp = build_dispatcher(settings, db, manager)
+    notifier.bind_manager(manager)  # window buttons need the paused flag
+    dp = build_dispatcher(settings, db, manager, notifier=notifier)
 
     await manager.start()
+
+    # Reboot reconciliation: mark dead jobs interrupted, sweep orphaned
+    # .part files, and tell each affected chat what it lost (with a
+    # Re-queue button). Must run before polling starts so the report is
+    # the first thing a returning user sees.
+    await recover_after_reboot(bot, settings, db)
 
     # ── HTTP surface (health always; webhook when configured) ───────────────
     app = create_web_app(manager)

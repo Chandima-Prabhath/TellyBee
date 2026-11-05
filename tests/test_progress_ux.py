@@ -41,7 +41,9 @@ class _ScriptedBot:
     def __init__(self, edit_errors=None, send_errors=None, delete_errors=None):
         self.sent: list[str] = []
         self.sends: list[tuple[int, str]] = []  # (chat_id, text)
+        self.send_markups: list[object] = []  # reply_markup of each send
         self.edits: list[str] = []
+        self.edit_markups: list[object] = []  # reply_markup of each edit
         self.deleted: list[tuple[int, int]] = []
         self.edit_attempts = 0
         self.send_attempts = 0
@@ -56,6 +58,7 @@ class _ScriptedBot:
             raise self._send_errors.pop(0)
         self.sent.append(text)
         self.sends.append((chat_id, text))
+        self.send_markups.append(kwargs.get("reply_markup"))
         self._next_id += 1
         return SimpleNamespace(message_id=self._next_id)
 
@@ -64,6 +67,7 @@ class _ScriptedBot:
         if self._edit_errors:
             raise self._edit_errors.pop(0)
         self.edits.append(text)
+        self.edit_markups.append(kwargs.get("reply_markup"))
 
     async def delete_message(self, chat_id=None, message_id=None, **kwargs):
         if self._delete_errors:
@@ -618,3 +622,103 @@ async def test_active_entry_cap_keeps_message_small(settings, tmp_path):
     assert "E06.mkv" not in text  # beyond the cap → counted, not shown
     assert "E07.mkv" not in text
     await notifier.aclose()
+
+
+# ── the window's inline keyboard (0.4.1) ────────────────────────────────────
+
+
+def _fake_manager(paused: bool = False):
+    return SimpleNamespace(paused=paused)
+
+
+def test_keyboard_absent_without_bound_manager(settings):
+    notifier = Notifier(bot=object(), settings=settings)
+    from app.services.notifier import _Window
+
+    assert notifier._keyboard(_Window(CHAT)) is None
+
+
+def test_keyboard_reflects_pause_state(settings):
+    from aiogram.types import InlineKeyboardMarkup
+
+    notifier = Notifier(bot=object(), settings=settings)
+    notifier.bind_manager(_fake_manager(paused=False))
+    from app.services.notifier import _Window
+
+    kb = notifier._keyboard(_Window(CHAT))
+    assert isinstance(kb, InlineKeyboardMarkup)
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    assert "⏸ Pause" in labels
+    datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "tb:pause" in datas and "tb:queue" in datas and "tb:stats" in datas
+
+    notifier.bind_manager(_fake_manager(paused=True))
+    kb = notifier._keyboard(_Window(CHAT))
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    assert "▶️ Resume" in labels
+    datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "tb:resume" in datas
+
+
+def test_keyboard_shows_cancel_only_with_live_work(settings):
+    notifier = Notifier(bot=object(), settings=settings)
+    notifier.bind_manager(_fake_manager())
+    from app.services.notifier import _Window
+
+    empty = notifier._keyboard(_Window(CHAT))
+    datas = [b.callback_data for row in empty.inline_keyboard for b in row]
+    assert "tb:cancel" not in datas and "tb:help" in datas
+
+    window = _Window(CHAT)
+    window.live["j1"] = _job(settings.download_dir, "busy.mkv")
+    busy = notifier._keyboard(window)
+    datas = [b.callback_data for row in busy.inline_keyboard for b in row]
+    assert "tb:cancel" in datas
+
+
+async def test_window_send_and_edit_carry_the_keyboard(settings, tmp_path, monkeypatch):
+    _fast(monkeypatch)
+    settings.progress_edit_interval = 0.05  # let an edit land inside the test
+    bot = _ScriptedBot()
+    notifier = Notifier(bot, settings)
+    notifier.bind_manager(_fake_manager())
+    job = _job(tmp_path, "E30.mkv")
+    job.status = JobStatus.RUNNING
+    job.waiting_since = time.monotonic() - 5
+    job.fetch_total = job.file_size
+    job.fetch_done = int(job.file_size * 0.4)
+    notifier.attach(job)
+    await asyncio.sleep(0.2)  # debounce → create → a paced edit or two
+
+    assert bot.send_markups and bot.send_markups[0] is not None, "buttons on send"
+    assert any(m is not None for m in bot.edit_markups), "buttons survive edits"
+    await notifier.aclose()
+
+
+async def test_paused_state_shows_in_header(settings, tmp_path):
+    notifier = Notifier(bot=object(), settings=settings)
+    notifier.bind_manager(_fake_manager(paused=True))
+    job = _job(tmp_path, "E31.mkv")
+    job.status = JobStatus.RUNNING
+    notifier.attach(job)
+
+    text = notifier._window_text(notifier._windows[CHAT])
+    assert "⏸ paused" in text
+
+
+async def test_request_refresh_resets_the_edit_throttle(settings, tmp_path):
+    import app.services.notifier as notifier_mod
+
+    notifier = Notifier(bot=object(), settings=settings)
+    notifier.bind_manager(_fake_manager())
+    job = _job(tmp_path, "E32.mkv")
+    job.status = JobStatus.RUNNING
+    notifier.attach(job)
+    window = notifier._windows[CHAT]
+    window._last_edit = time.monotonic()  # freshly edited → would be throttled
+
+    notifier.request_refresh(CHAT)
+
+    assert window._last_edit == 0.0  # next tick edits immediately
+    assert window.updater_task is not None and not window.updater_task.done()
+    _ = notifier_mod  # silence lint on the import used for side effects

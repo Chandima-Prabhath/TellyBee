@@ -32,6 +32,14 @@ Built on **aiogram 3** (fully async), **Python 3.12**, and a
   message** that updates in place — including **real progress while the
   local server is still fetching** the file from Telegram (watched on the
   shared volume).
+- 🖲 **The window is a remote control** — its button row (Pause/Resume,
+  Queue, Stats, Cancel, Help) does the job of the `/commands`, no typing
+  needed. Permissions mirror the commands exactly (stats/pause are
+  admin-only, users cancel their own files).
+- 🔁 **Survives reboots** — a startup reconciliation pass marks unfinished
+  jobs *interrupted*, sweeps orphaned `.part` files, and sends each chat a
+  report with a **Re-queue** button that restores the lost jobs from the
+  ledger — no re-forwarding needed.
 - 🎛 **Two-tier access control** — env-seeded admins & users, plus runtime
   `/allow` / `/disallow` / `/users` management persisted in SQLite.
 - 🗂 **Flexible storage layout** — configurable folder template like
@@ -143,7 +151,24 @@ the receipts (the permanent records) remain:
 ▰▰▰▰▱▱▱▱▱▱ 42% · 890 MB / 2.1 GB · 9.2 MB/s · ETA 2m 04s
 📡 E04.mkv — Telegram fetch · 310 MB / 1.7 GB · 4.1 MB/s
 ⏳ Queued — E05.mkv, E06.mkv +3 more
+
+[ ⏸ Pause ] [ 📋 Queue ] [ 📊 Stats ]
+[ ✖️ Cancel ] [ ❓ Help ]
 ```
+
+The bottom rows are **inline buttons** — the window doubles as the bot's
+remote control (see *Reboots & recovery* below for the Re-queue button):
+
+| Button | Who | Effect |
+|---|---|---|
+| ⏸ Pause / ▶️ Resume | admin | same as `/pause` / `/resume`; the button flips and the header shows ⏸ paused |
+| 📋 Queue | everyone | same view as `/queue` (users see their own jobs) |
+| 📊 Stats | admin | same as `/stats` |
+| ✖️ Cancel | everyone* | cancels the chat's downloads (users: own files only) |
+| ❓ Help | everyone | same as `/help` |
+
+Commands still work everywhere — the buttons are a shortcut, not a
+replacement.
 
 With a local Bot API server, big first-time downloads show the server-side
 fetch as real progress (watched on the shared volume) before the fast local
@@ -212,14 +237,14 @@ Everything is env-driven (`.env` file supported); human-friendly values like
 Telegram ──updates──► aiogram Dispatcher
                         │  middleware: throttle → auth → album-buffer
                         ▼
-                      Routers (common → admin → links → media)
+                      Routers (common → admin → callbacks → links → media)
                         │  builds DownloadJob (template + sanitized path)
                         ▼
                  DownloadManager (priority queue + N workers)
                         │                              │
                         ▼                              ▼
-              DownloadEngine (stream, retry,      Notifier (progress
-              hash, atomic rename)                edits + receipts)
+              DownloadEngine (stream, retry,      Notifier (window +
+              hash, atomic rename)               buttons + receipts)
                         │                              │
                         ▼                              ▼
                 SQLite ledger (users, downloads)   chat messages
@@ -237,6 +262,10 @@ Key design decisions (also documented for AI agents in `AGENT.md`):
   new task arrives so it always sits under the user's latest message,
   deleted when the queue drains); a media group still ends in exactly one
   combined receipt, which is the permanent record.
+- **Reboot reconciliation** — because the queue is memory-only, startup
+  runs a recovery pass (mark stale rows `interrupted`, sweep orphaned
+  `.part` files, report per chat with a Re-queue button that rebuilds jobs
+  from the ledger's stored `file_id`s).
 - **Atomicity everywhere** — partial downloads write `<name>.part` and are
   renamed on success; cancellation and shutdown clean up reliably.
 - **Isolation** — handlers never block (no sync I/O on the hot path), and a
@@ -408,6 +437,60 @@ not apply; the transfer runs at your host's connection speed.
 
 ---
 
+## 🔁 Reboots & recovery
+
+The download queue lives in memory (fast, simple, no stale locks); SQLite is
+the durable record. When the process dies mid-job, three kinds of mess used
+to be left behind — all three are handled automatically since v0.4.1:
+
+**1. Dead ledger rows.** Anything still `queued`/`running` at boot belongs to
+a previous life. Startup marks those rows `interrupted` (a one-time schema
+migration adds the status; your existing database upgrades in place, data
+preserved).
+
+**2. Orphaned `.part` files.** A hard kill leaves half-written
+`<name>.part` files behind. No worker exists yet at boot, so any `.part` is
+by definition abandoned — the recovery pass sweeps them all.
+
+**3. Silence.** Each chat that lost work gets exactly one report:
+
+```
+🔁 Rebooted mid-job — 3 downloads were interrupted:
+• E07.mkv — 1.4 GB
+• E08.mkv — 1.3 GB
+• E09.mkv — 1.2 GB
+
+Re-send them, or press the button — the queue picks up where it can.
+
+[ 🔁 Re-queue 3 files ]
+```
+
+**Re-queue** rebuilds the jobs straight from the ledger (stored
+`file_id`, `file_unique_id`, destination path, album grouping) and puts them
+back into the live queue — receipts and the progress window work exactly as
+if you had re-sent the files. Files that meanwhile completed (or are already
+queued) are skipped and reported; if the queue is full the rest stays
+`interrupted` and the button can be pressed again later. `/status` shows
+💤 interrupted and 🔁 re-queued entries.
+
+Two more reboot facts worth knowing:
+
+- **Forwarded-while-down messages are not lost** — Telegram keeps
+  unconfirmed updates for 24 h and re-delivers them when the bot returns.
+- **The botapi cache keeps completed files** — if only the tellybee
+  container restarted, files the local server had finished fetching are
+  still there: re-send (or re-queue) and the copy is near-instant.
+  Half-finished server-side fetches are *not* resumed by the server; those
+  restart from zero.
+
+For graceful shutdowns (`docker compose down/up --build`), the compose
+example sets `stop_grace_period: 40s` so the bot's 25 s drain can actually
+finish — pending jobs are then cleanly `cancelled` with receipts instead of
+being interrupted. Users with an older local compose file can add that one
+line under the `tellybee` service.
+
+---
+
 ## 🔧 Development
 
 ```bash
@@ -449,6 +532,8 @@ before contributing (humans and AI assistants alike).
 | `…exceeds 4.0 GB limit` on intake | Telegram's absolute per-file maximum (Premium uploads cap at 4 GB) — nothing larger exists to download. Use a direct link instead. |
 | Queue full rejections | Raise `MAX_QUEUE_SIZE` and/or `DOWNLOAD_CONCURRENCY`. |
 | Healthcheck failing | `curl http://localhost:8080/healthz` — if the bot is crash-looping, check `docker compose logs`. |
+| Old database on upgrade to ≥ 0.4.1 | Nothing to do — the `downloads` table (status CHECK) is migrated in place at startup, data preserved; first boot also marks stale rows `interrupted`, sweeps `.part` orphans, and reports per chat. |
+| `docker compose down` kills the bot mid-drain | Docker's default 10 s stop grace is shorter than the bot's 25 s drain — add `stop_grace_period: 40s` under the `tellybee` service (current compose example already has it). |
 
 ---
 
