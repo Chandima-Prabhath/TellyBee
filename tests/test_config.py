@@ -219,11 +219,19 @@ def test_link_settings_defaults_and_bounds():
     assert s.links_enabled is True
     assert s.link_connections == 4
     assert s.link_max_size == 0  # uncapped
+    assert s.link_ssrf_guard == "basic"
 
     with pytest.raises(ValidationError, match="LINK_CONNECTIONS"):
         Settings(bot_token=VALID_TOKEN, link_connections=0)
     with pytest.raises(ValidationError, match="LINK_CONNECTIONS"):
         Settings(bot_token=VALID_TOKEN, link_connections=32)
+
+
+def test_link_ssrf_guard_mode_validation():
+    assert Settings(bot_token=VALID_TOKEN, link_ssrf_guard="STRICT").link_ssrf_guard == "strict"
+    assert Settings(bot_token=VALID_TOKEN, link_ssrf_guard=" off ").link_ssrf_guard == "off"
+    with pytest.raises(ValidationError, match="LINK_SSRF_GUARD"):
+        Settings(bot_token=VALID_TOKEN, link_ssrf_guard="paranoid")
 
 
 def test_link_max_size_accepts_human_and_blank():

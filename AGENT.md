@@ -234,7 +234,14 @@ models — see `tests/test_media_types.py` for the pattern.
   `DownloadError`. SSRF protection is DUAL-LAYER: aiohttp's connector
   *skips the resolver for IP-literal hosts*, so `validate_url` checks those
   directly, while `_SafeResolver` guards DNS names at connect time
-  (covers redirects + rebinding, no TOCTOU gap). Error text shown to users
+  (covers redirects + rebinding, no TOCTOU gap). CRITICAL aiohttp trap:
+  resolver entries hold the address under `host` and the queried NAME under
+  `hostname` since aiohttp 3.10 (TypedDict since 3.11; ≤3.9 dicts kept the
+  address under `hostname`) — ALWAYS extract via `_resolved_ip`, never
+  read a field directly: v0.3.0 read `entry["hostname"]` and thereby
+  rejected EVERY hostname link with a bogus "private address" message.
+  Guard mode is `LINK_SSRF_GUARD` (strict/basic/off, default basic),
+  threaded into both layers via `_SsrfGuard`. Error text shown to users
   is query-string-scrubbed (`strip_query`) because signed URLs carry
   secrets in the query.
 - **Ranged multi-connection downloads write through one shared fd** with

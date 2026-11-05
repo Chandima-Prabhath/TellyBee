@@ -185,6 +185,7 @@ Everything is env-driven (`.env` file supported); human-friendly values like
 | `LINKS_ENABLED` | `true` | allow direct http(s) link downloads |
 | `LINK_CONNECTIONS` | `4` | parallel range connections per link (1–16) |
 | `LINK_MAX_SIZE` | `0` | per-link size cap, `0` = uncapped (e.g. `10GB`) |
+| `LINK_SSRF_GUARD` | `basic` | link target filter: `basic` (internal IPs only) / `strict` (non-global too) / `off` (no checks) |
 | `ALLOWED_TYPES` | *(all)* | only accept these media types |
 | `BLOCKED_TYPES` | *(none)* | never accept these media types |
 | `PROGRESS_MIN_BYTES` | `2MB` | live progress message threshold |
@@ -367,10 +368,14 @@ not apply; the transfer runs at your host's connection speed.
   part resumes itself from its current offset on transient errors.
 - **Safety:** only `http`/`https` URLs, redirects followed but re-checked,
   and an SSRF guard inside the HTTP connector **refuses to connect to
-  private / loopback / link-local / reserved addresses** — a crafted link
-  can never reach your LAN, the docker network or cloud metadata endpoints.
-  URLs with embedded credentials (`user:pass@…`) are rejected, and signed
-  query strings are stripped from any error text shown in chat/logs.
+  internal addresses** (loopback, your LAN, the docker network, cloud
+  metadata endpoints) — a crafted link can never reach them. The mode is
+  `LINK_SSRF_GUARD`: `basic` (default) blocks internal targets only,
+  `strict` additionally refuses unusual non-global address space, and `off`
+  disables the checks entirely — handy to download from a host on your own
+  LAN. URLs with embedded credentials (`user:pass@…`) are rejected, and
+  signed query strings are stripped from any error text shown in chat/logs.
+  When the guard refuses, its message names the exact address it rejected.
 - **Limits:** `LINK_MAX_SIZE` (default uncapped) caps the accepted size;
   unknown sizes are enforced mid-transfer; the queue's disk-headroom guard
   and ENOSPC fail-fast apply exactly as for Telegram files. Disable the
@@ -409,7 +414,7 @@ before contributing (humans and AI assistants alike).
 | `ApiTokenValidationError` in logs | Token revoked/regenerated — update `.env` and restart. |
 | Files > 20 MB fail | Expected with the standard Bot API — see the *Big files* section. |
 | Files > 2 GB rejected / do bigger files work? | Yes — with the local Bot API server, downloads have **no size limit** (4 GB is Telegram's own per-file ceiling). Set `MAX_FILE_SIZE=4000MB` and `API_BASE=http://botapi:8081`. A >2 GB file can only originate from a Premium upload — forwarding one to the bot as a free user works fine. |
-| Link download says *“the host resolves to a private or otherwise blocked address”* | The SSRF guard refused an internal/loopback/reserved IP — by design. Link the file via its public URL, or (deliberately, on trusted networks only) host it on a public address. |
+| Link download says *“refusing to connect: … resolves to …, a private or otherwise blocked address”* | The SSRF guard refused an internal/loopback address — by design, and the message now names it. If you trust the source (e.g. a host on your own LAN), set `LINK_SSRF_GUARD=off`. On v0.3.0 this message appeared for **every** link — aiohttp moved the resolver's address field and the guard read the wrong one; update to ≥ 0.3.1 (`git pull && docker compose up -d --build`). |
 | Link download fails with *“the server answered HTTP 404/403…”* | The server rejected the request (expired signed URL, auth required, gone). Nothing retryable — fetch a fresh link. |
 | Progress message stuck at “Telegram is preparing…” with no % | The volume watcher could not match a growing file in the server's storage (e.g. the job's size is unknown). Display-only — the download itself is unaffected. |
 | Big files download slowly | See *Speeding up big-file downloads* — prefetching is on by default; the `botapi-fast` build multiplies single-file speed; check the host's link/disk. |

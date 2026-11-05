@@ -10,10 +10,13 @@ Design goals:
   saturates the host's bandwidth where a single stream would not. Servers
   without range support silently fall back to a single streamed connection.
 * **Safe** — an SSRF guard inside the connector's resolver refuses to
-  connect to private / loopback / link-local / reserved addresses (so a
-  crafted link can never reach the host's internal network or the docker
-  network's other services), only http/https schemes are allowed, and URLs
-  with embedded credentials are rejected outright.
+  connect to internal addresses (loopback, LAN, link-local incl. cloud
+  metadata, unique-local IPv6 — a crafted link can never reach the host's
+  internal network or the docker network's other services), only http/https
+  schemes are allowed, and URLs with embedded credentials are rejected
+  outright. The guard mode is configurable (``LINK_SSRF_GUARD``): ``basic``
+  (default) blocks internal targets only, ``strict`` additionally refuses
+  unusual non-global address space, ``off`` disables the checks.
 * **Bounded** — ``LINK_MAX_SIZE`` caps the accepted size (when the server
   declares it), unknown sizes are enforced mid-transfer, and the queue's
   disk-headroom guard applies exactly like for Telegram files.
@@ -63,23 +66,28 @@ class UrlRejected(Exception):
 #: Raised by the SSRF guard inside the connector's resolver. Subclasses
 #: ValueError so it slips through aiohttp's OSError-wrapping untouched, and
 #: is converted to a non-retryable UrlRejected at every call site.
-_SSRF_MESSAGE = (
-    "refusing to connect: the host resolves to a private or otherwise "
-    "blocked address (SSRF guard)"
-)
-
-
 class _SsrfBlockedError(ValueError):
     pass
+
+
+def _blocked_message(host: str, ip: object) -> str:
+    """Chat-friendly SSRF rejection that names the exact address refused."""
+    return (
+        f"refusing to connect: {host} resolves to {ip}, a private or "
+        "otherwise blocked address (SSRF guard). If you trust this source, "
+        "set LINK_SSRF_GUARD=off"
+    )
 
 
 # ── URL validation & filenames ──────────────────────────────────────────────
 
 
-def validate_url(url: str) -> str:
+def validate_url(url: str, guard: _SsrfGuard | None = None) -> str:
     """Basic URL sanity for link downloads. Returns the cleaned URL.
 
     Raises :class:`UrlRejected` with a chat-friendly reason otherwise.
+    ``guard`` selects the SSRF mode used for IP-literal hosts (defaults to
+    ``basic``; the downloader passes its configured one).
     """
     url = (url or "").strip().strip("<>")
     if not url:
@@ -100,8 +108,8 @@ def validate_url(url: str) -> str:
     except ValueError:
         pass  # a hostname — resolver guard applies
     else:
-        if not _allowed_ip(ip):
-            raise UrlRejected(_SSRF_MESSAGE)
+        if not (guard or _SsrfGuard()).allowed(ip):
+            raise UrlRejected(_blocked_message(host, ip))
     return url
 
 
@@ -163,7 +171,7 @@ def filename_from_response(
 
 
 def _allowed_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """True only for addresses that are unambiguously public."""
+    """True only for addresses that are unambiguously public (strict mode)."""
     if (
         ip.is_loopback
         or ip.is_link_local
@@ -180,15 +188,101 @@ def _allowed_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return True
 
 
+#: Explicitly internal targets — everything ``basic`` mode refuses. Kept as
+#: an explicit list (not the ``ipaddress`` properties, whose ``is_private``
+#: semantics drifted across Python releases) so behavior is deterministic:
+#: loopback, RFC1918 LANs, link-local (incl. the 169.254.169.254 cloud
+#: metadata endpoint), unique-local IPv6, multicast, unspecified/0.0.0.0.
+_BASIC_BLOCKED_V4 = (
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("255.255.255.255/32"),
+)
+_BASIC_BLOCKED_V6 = (
+    ipaddress.ip_network("::/128"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("ff00::/8"),
+)
+
+
+class _SsrfGuard:
+    """Mode-aware SSRF predicate (``LINK_SSRF_GUARD``).
+
+    * ``basic`` — refuse genuinely internal targets only. Public-but-unusual
+      space (CGNAT 100.64/10, benchmarking 198.18/15, …) is allowed: real
+      file hosts never sit there, but some ISP/CDN setups hand out such
+      addresses and refusing them breaks links for no security gain.
+    * ``strict`` — additionally refuse everything not unambiguously public
+      (the pre-0.3.1 behavior).
+    * ``off`` — no address checks at all (trusted bots, LAN file sources).
+    """
+
+    __slots__ = ("mode",)
+
+    def __init__(self, mode: str = "basic") -> None:
+        self.mode = (mode or "basic").lower()
+
+    def allowed(self, ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        if self.mode == "off":
+            return True
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        blocked = _BASIC_BLOCKED_V6 if ip.version == 6 else _BASIC_BLOCKED_V4
+        if any(ip in network for network in blocked):
+            return False
+        if self.mode == "strict":
+            return _allowed_ip(ip)
+        return True
+
+
+def _resolved_ip(
+    entry: object,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The resolved address of a resolver entry, whichever field holds it.
+
+    aiohttp >= 3.10 records the address under ``host`` and the queried name
+    under ``hostname`` (a NamedTuple in 3.10; a TypedDict — a plain dict at
+    runtime — since 3.11, which is what string indexing needs). aiohttp
+    <= 3.9 returned plain dicts with the address under ``hostname`` instead.
+    Whichever field parses as an IP address IS the address; the other one is
+    the name. Reading a fixed field breaks on half the aiohttp versions in
+    the wild — v0.3.0 read ``entry["hostname"]`` and thereby rejected
+    every hostname link with a bogus "private address" message.
+    """
+    if isinstance(entry, dict):
+        candidates: tuple[object, ...] = (entry.get("host"), entry.get("hostname"))
+    else:  # NamedTuple entries (aiohttp 3.10.x)
+        candidates = (getattr(entry, "host", None), getattr(entry, "hostname", None))
+    for value in candidates:
+        if not isinstance(value, str):
+            continue
+        try:
+            return ipaddress.ip_address(value)
+        except ValueError:
+            continue
+    return None
+
+
 class _SafeResolver(aiohttp.abc.AbstractResolver):
-    """DNS resolver that refuses private/resolved-to-private targets.
+    """DNS resolver that refuses to connect to private/internal targets.
 
     aiohttp asks the connector's resolver for every connection attempt —
     including redirects — so hooking here blocks SSRF attempts (and DNS
     rebinding to internal addresses) at connect time, with no TOCTOU gap.
+    Entries are returned unchanged, so aiohttp connects to exactly the
+    addresses that were checked. The guard mode comes from
+    ``LINK_SSRF_GUARD`` via the injected :class:`_SsrfGuard`.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, guard: _SsrfGuard) -> None:
+        self._guard = guard
         self._inner = aiohttp.DefaultResolver()
 
     async def resolve(  # type: ignore[override]
@@ -196,12 +290,17 @@ class _SafeResolver(aiohttp.abc.AbstractResolver):
     ) -> list[dict]:
         entries = await self._inner.resolve(host, port, family)
         for entry in entries:
-            try:
-                ip = ipaddress.ip_address(entry["hostname"])
-            except ValueError:
-                raise _SsrfBlockedError("could not interpret the resolved address") from None
-            if not _allowed_ip(ip):
-                raise _SsrfBlockedError(_SSRF_MESSAGE)
+            ip = _resolved_ip(entry)
+            if ip is None:
+                # No parseable address in the entry — refuse rather than
+                # connect to something unchecked. Defensive: stock aiohttp
+                # resolvers always fill one of the two fields.
+                raise _SsrfBlockedError(
+                    "refusing to connect: the resolver answer for "
+                    f"{host!r} contains no IP address (SSRF guard)"
+                ) from None
+            if not self._guard.allowed(ip):
+                raise _SsrfBlockedError(_blocked_message(host, ip))
         return entries
 
     async def close(self) -> None:  # type: ignore[override]
@@ -238,6 +337,7 @@ class UrlDownloader:
 
     def __init__(self, settings: Settings):
         self._settings = settings
+        self._guard = _SsrfGuard(settings.link_ssrf_guard)
         self._http: aiohttp.ClientSession | None = None
 
     async def _session(self) -> aiohttp.ClientSession:
@@ -250,7 +350,7 @@ class UrlDownloader:
                     total=None, connect=15, sock_connect=15, sock_read=120
                 ),
                 connector=aiohttp.TCPConnector(
-                    resolver=_SafeResolver(),
+                    resolver=_SafeResolver(self._guard),
                     limit=max(8, self._settings.link_connections * 3),
                     limit_per_host=max(8, self._settings.link_connections * 2),
                     ttl_dns_cache=300,
@@ -271,7 +371,7 @@ class UrlDownloader:
         errors propagate as regular aiohttp/OSError exceptions so the caller
         can retry.
         """
-        url = validate_url(url)
+        url = validate_url(url, guard=self._guard)
         session = await self._session()
         try:
             async with session.get(
@@ -284,7 +384,7 @@ class UrlDownloader:
                         return await self._probe_from_response(plain, url)
                 return await self._probe_from_response(resp, url)
         except _SsrfBlockedError as err:
-            raise UrlRejected(_SSRF_MESSAGE) from err
+            raise UrlRejected(str(err)) from err
 
     async def _probe_from_response(
         self, resp: aiohttp.ClientResponse, url: str
@@ -350,7 +450,7 @@ class UrlDownloader:
             # SSRF block raised mid-transfer (e.g. redirect to an internal
             # host) — non-retryable, like every other guard rejection.
             part_file.unlink(missing_ok=True)
-            raise UrlRejected(_SSRF_MESSAGE) from err
+            raise UrlRejected(str(err)) from err
         except UrlRejected:
             part_file.unlink(missing_ok=True)
             raise
@@ -492,7 +592,7 @@ class UrlDownloader:
             except JobCancelled:
                 raise
             except _SsrfBlockedError as err:
-                raise UrlRejected(_SSRF_MESSAGE) from err
+                raise UrlRejected(str(err)) from err
             except (TimeoutError, aiohttp.ClientError, OSError) as err:
                 last_error = err
                 logger.warning(

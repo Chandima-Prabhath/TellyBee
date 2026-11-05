@@ -176,6 +176,11 @@ class Settings(BaseSettings):
     # Per-link size cap; 0 = uncapped (the queue's disk-headroom guard and
     # ENOSPC handling still apply). Accepts human sizes, e.g. 10GB.
     link_max_size: int = 0
+    # SSRF guard mode for link downloads: "basic" refuses internal targets
+    # only (loopback, LAN, link-local/metadata, unique-local IPv6); "strict"
+    # additionally refuses unusual non-global space (CGNAT, benchmarking…);
+    # "off" disables address checks entirely (trusted/private bots).
+    link_ssrf_guard: str = "basic"
 
     # ── Progress UX ─────────────────────────────────────────────────────────
     # Only files (or albums) at least this big get a live progress message.
@@ -236,6 +241,14 @@ class Settings(BaseSettings):
         if isinstance(raw, str) and not raw.strip():
             return 0
         return parse_size(raw)
+
+    @field_validator("link_ssrf_guard")
+    @classmethod
+    def _validate_ssrf_mode(cls, raw: str) -> str:
+        mode = (raw or "basic").strip().lower()
+        if mode not in {"strict", "basic", "off"}:
+            raise ValueError("LINK_SSRF_GUARD must be 'strict', 'basic' or 'off'")
+        return mode
 
     @field_validator("bot_token", mode="before")
     @classmethod
@@ -377,5 +390,5 @@ class Settings(BaseSettings):
             f"admins={len(self.admin_ids)} allowed={len(self.allowed_user_ids)} "
             f"open_access={self.open_access} "
             f"prefetch={self.prefetch and self.prefetch_slots > 0} "
-            f"links={self.links_enabled}"
+            f"links={self.links_enabled} ssrf={self.link_ssrf_guard}"
         )

@@ -5,6 +5,10 @@ Covers the v0.3 /link feature end-to-end against a real aiohttp test server:
 * single-stream fallback when the server ignores byte ranges,
 * parallel ranged transfers with per-part resume data written via pwrite,
 * non-retryable rejections (bad URL, HTTP 4xx, size cap, SSRF to loopback),
+* the LINK_SSRF_GUARD modes, and the v0.3.1 regression: aiohttp ≥ 3.10
+  stores the resolved address in the ``host`` field of resolver entries
+  (``hostname`` holds the queried name) — the old guard read ``hostname``
+  and refused EVERY hostname link with a bogus "private address" message,
 * cancellation mid-transfer and the query-string scrubbing of error text.
 """
 
@@ -14,6 +18,7 @@ import asyncio
 import hashlib
 import ipaddress
 import re
+import socket
 import time
 from types import SimpleNamespace
 
@@ -30,6 +35,7 @@ from app.services.urlfetch import (
     UrlDownloader,
     UrlRejected,
     _allowed_ip,
+    _SsrfGuard,
     filename_from_response,
     parse_content_disposition,
     strip_query,
@@ -79,10 +85,11 @@ def _engine(settings) -> DownloadEngine:
 def _allow_loopback(monkeypatch) -> None:
     """Bypass the SSRF guard for tests that must hit the local test server.
 
-    Patches the single predicate both guard layers consult (the URL-literal
-    check in validate_url and the resolver), leaving everything else real.
+    Patches the mode-aware predicate both guard layers consult (the
+    URL-literal check in validate_url and the resolver), leaving everything
+    else real.
     """
-    monkeypatch.setattr(urlfetch, "_allowed_ip", lambda ip: True)
+    monkeypatch.setattr(urlfetch._SsrfGuard, "allowed", lambda self, ip: True)
 
 
 def _range_app(data: bytes, *, concurrency: list[int] | None = None,
@@ -220,6 +227,127 @@ def test_allowed_ip(ip, allowed):
     assert _allowed_ip(ipaddress.ip_address(ip)) is allowed
 
 
+# ── SSRF guard modes (LINK_SSRF_GUARD) ──────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("mode", "ip", "allowed"),
+    [
+        # basic refuses genuinely internal targets …
+        ("basic", "10.0.0.1", False),
+        ("basic", "172.31.255.1", False),
+        ("basic", "192.168.1.1", False),
+        ("basic", "127.0.0.1", False),
+        ("basic", "169.254.169.254", False),  # cloud metadata
+        ("basic", "0.0.0.0", False),
+        ("basic", "224.0.0.1", False),
+        ("basic", "::1", False),
+        ("basic", "fe80::1", False),
+        ("basic", "fc00::1", False),
+        ("basic", "::ffff:10.0.0.1", False),  # v4-mapped private
+        # … but allows public-but-unusual space that strict refuses
+        ("basic", "100.64.1.1", True),  # CGNAT shared range
+        ("basic", "198.18.0.5", True),  # benchmarking
+        ("basic", "95.211.142.134", True),  # a real seedr node
+        ("strict", "100.64.1.1", False),
+        ("strict", "95.211.142.134", True),
+        # off disables the checks entirely
+        ("off", "127.0.0.1", True),
+        ("off", "10.0.0.1", True),
+        ("off", "169.254.169.254", True),
+    ],
+)
+def test_ssrf_guard_modes(mode, ip, allowed):
+    assert _SsrfGuard(mode).allowed(ipaddress.ip_address(ip)) is allowed
+
+
+def test_validate_url_ip_literals_respect_guard_mode():
+    with pytest.raises(UrlRejected, match="SSRF"):
+        validate_url("http://192.168.1.10/file.bin", guard=_SsrfGuard("basic"))
+    assert (
+        validate_url("http://192.168.1.10/file.bin", guard=_SsrfGuard("off"))
+        == "http://192.168.1.10/file.bin"
+    )
+    with pytest.raises(UrlRejected, match="100.64.1.1"):
+        validate_url("http://100.64.1.1/file.bin", guard=_SsrfGuard("strict"))
+    assert validate_url("http://100.64.1.1/file.bin", guard=_SsrfGuard("basic"))
+
+
+# ── the resolver guard (v0.3.1 regression) ──────────────────────────────
+
+
+def _resolver_entry(name: str, ip: str, *, old_style: bool = False) -> dict:
+    """One aiohttp resolver entry, in either historical field convention.
+
+    aiohttp >= 3.10: address under ``host``, queried name under ``hostname``
+    (a TypedDict — plain dict at runtime — since 3.11). aiohttp <= 3.9 kept
+    plain dicts with the address under ``hostname`` instead.
+    """
+    entry: dict = {"port": 443, "family": socket.AF_INET, "proto": 6, "flags": 0}
+    if old_style:
+        entry |= {"hostname": ip, "host": name}
+    else:
+        entry |= {"hostname": name, "host": ip}
+    return entry
+
+
+class _FakeInnerResolver:
+    def __init__(self, entries: list[dict]) -> None:
+        self._entries = entries
+
+    async def resolve(
+        self, host: str, port: int = 0, family: int = socket.AF_INET
+    ) -> list[dict]:
+        return list(self._entries)
+
+    async def close(self) -> None:
+        return None
+
+
+def _resolver(entries: list[dict], mode: str = "basic") -> urlfetch._SafeResolver:
+    resolver = urlfetch._SafeResolver(_SsrfGuard(mode))
+    resolver._inner = _FakeInnerResolver(entries)  # noqa: SLF001
+    return resolver
+
+
+@pytest.mark.parametrize("old_style", [False, True], ids=["new-style", "old-style"])
+async def test_resolver_accepts_public_host(old_style):
+    """Regression (v0.3.0): the guard read ``entry["hostname"]`` as the
+    resolved IP; since aiohttp 3.10 that field holds the queried NAME, so
+    every hostname link was refused with a bogus SSRF message.
+    """
+    resolver = _resolver(
+        [_resolver_entry("nw34.seedr.cc", "95.211.142.134", old_style=old_style)]
+    )
+    entries = await resolver.resolve("nw34.seedr.cc", 443)
+    assert entries[0]  # passed through unchanged, guard satisfied
+
+
+async def test_resolver_blocks_private_target_with_named_message():
+    resolver = _resolver([_resolver_entry("cache.lan", "192.168.1.50")])
+    with pytest.raises(urlfetch._SsrfBlockedError) as excinfo:
+        await resolver.resolve("cache.lan", 443)
+    message = str(excinfo.value)
+    assert "cache.lan" in message
+    assert "192.168.1.50" in message
+    assert "LINK_SSRF_GUARD=off" in message
+
+
+async def test_resolver_off_mode_allows_internal_target():
+    resolver = _resolver([_resolver_entry("nas.local", "10.0.0.5")], mode="off")
+    entries = await resolver.resolve("nas.local", 443)
+    assert entries[0]["host"] == "10.0.0.5"
+
+
+async def test_resolver_rejects_entries_without_an_ip():
+    resolver = _resolver(
+        [{"hostname": "???", "host": "also-not-an-ip", "port": 443,
+          "family": socket.AF_INET, "proto": 6, "flags": 0}]
+    )
+    with pytest.raises(urlfetch._SsrfBlockedError):
+        await resolver.resolve("weird.example", 443)
+
+
 # ── probing against a live server ──────────────────────────────────────────
 
 
@@ -327,7 +455,7 @@ async def test_probe_range_hating_403_falls_back_to_plain(settings, monkeypatch)
 
 
 async def test_probe_loopback_blocked_by_ssrf_guard(settings):
-    """The real resolver must refuse loopback targets (SSRF guard).
+    """The real guard must refuse loopback targets (SSRF protection).
 
     No monkeypatching here — the guard itself is under test.
     """
@@ -345,6 +473,31 @@ async def test_probe_loopback_blocked_by_ssrf_guard(settings):
             await downloader.probe(str(server.make_url("/secret.bin")))
         await downloader.aclose()
     finally:
+        await server.close()
+
+
+async def test_probe_hostname_resolving_to_loopback_is_blocked(settings):
+    """A URL whose HOSTNAME (not IP literal) resolves to loopback must be
+    refused by the resolver layer — the path real SSRF attacks take.
+    """
+    app = web.Application()
+
+    async def handler(request):
+        return web.Response(body=b"never reached")
+
+    app.router.add_get("/secret.bin", handler)
+    server = TestServer(app)
+    await server.start_server()
+    downloader = UrlDownloader(settings)
+    try:
+        url = str(server.make_url("/secret.bin")).replace("127.0.0.1", "localhost", 1)
+        with pytest.raises(UrlRejected, match="localhost") as excinfo:
+            await downloader.probe(url)
+        message = str(excinfo.value)
+        # names the exact refused address (v4 or v6 loopback, host-dependent)
+        assert "127.0.0.1" in message or "::1" in message
+    finally:
+        await downloader.aclose()
         await server.close()
 
 
