@@ -13,7 +13,7 @@ from app.middleware.album import AlbumMiddleware
 def _album_message(index: int, group: str | None) -> Message:
     return Message(
         message_id=index,
-        date=datetime.datetime.now(datetime.timezone.utc),
+        date=datetime.datetime.now(datetime.UTC),
         chat=Chat(id=100, type="private"),
         media_group_id=group,
     )

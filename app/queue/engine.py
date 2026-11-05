@@ -26,6 +26,22 @@ Two transport modes:
   them ``0600``) as its *own* user, it must run under the same uid as this
   bot — the compose example wires that up — otherwise every read fails
   with ``PermissionError``.
+
+Local-mode performance pipeline (v0.3+):
+
+* **Prefetch** — the *slow* part of local mode is the server-side download
+  from Telegram (``getFile`` blocks until TDLib has fetched the whole
+  file; TDLib keeps only ~2 MiB of a file in flight per Telegram DC).
+  Queued jobs therefore trigger their ``getFile`` immediately through a
+  bounded prefetch pool instead of waiting for a worker slot, so the
+  server downloads ahead while workers copy finished files.
+* **Fetch progress** — while ``getFile`` is parked, a watcher polls the
+  server's shared storage for growing files and maps them to waiting jobs
+  by expected size, so the chat shows real % / speed / ETA during the
+  otherwise opaque "preparing" phase.
+* **Direct links** — jobs with ``media_type == "url"`` bypass Telegram
+  entirely and are fetched by :class:`~app.services.urlfetch.UrlDownloader`
+  (parallel ranged connections, SSRF-guarded).
 """
 
 from __future__ import annotations
@@ -35,9 +51,11 @@ import contextlib
 import errno
 import hashlib
 import logging
+import os
 import random
+import re
+import stat
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
@@ -45,7 +63,16 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramNetworkError
 
 from app.config import Settings
-from app.queue.jobs import DownloadJob
+from app.queue.errors import DownloadError, EngineResult, JobCancelled
+from app.queue.jobs import DownloadJob, JobStatus
+from app.services.urlfetch import (
+    UrlDownloader,
+    UrlRejected,
+    disk_full_error,
+    strip_query,
+)
+
+__all__ = ["DownloadEngine", "DownloadError", "EngineResult", "JobCancelled"]
 
 logger = logging.getLogger(__name__)
 
@@ -58,22 +85,18 @@ _GETFILE_CANCEL_POLL = 1.0
 #: many hours, and re-issuing getFile does not restart the server's progress
 #: (it parks the query and answers when the download completes).
 _GETFILE_TOTAL_BUDGET = 24 * 3600.0
+#: Files in the server's storage older than this (wall-clock seconds) are
+#: ignored by the fetch-progress watcher — they are cache, not active fetches.
+_FETCH_SCAN_MAX_AGE = 120.0
+#: Match tolerance when pairing a growing server-side file with a job's
+#: expected size (TDLib may report a few bytes more than the API declared).
+_FETCH_SIZE_TOLERANCE = 4096
+_URL_SCRUB_RE = re.compile(r"https?://\S+")
 
 
-class JobCancelled(Exception):
-    """Raised when a job's cancel event fires mid-transfer."""
-
-
-class DownloadError(Exception):
-    """All retries exhausted; the job failed."""
-
-
-@dataclass(frozen=True, slots=True)
-class EngineResult:
-    sha256: str
-    bytes_written: int
-    duration_ms: int
-    avg_speed: float
+# JobCancelled / DownloadError / EngineResult now live in app.queue.errors
+# and are re-exported above for backward compatibility (manager, handlers and
+# tests import them from app.queue.engine).
 
 
 class _FileCache:
@@ -122,6 +145,20 @@ class DownloadEngine:
         )
         api = getattr(getattr(bot, "session", None), "api", None)
         self._local_mode = bool(getattr(api, "is_local", False))
+        # ── local-mode fetch pipeline state ─────────────────────────────
+        # file_id → the ONE shared getFile task (many jobs may await it)
+        self._inflight: dict[str, asyncio.Task] = {}
+        # job_id → job while it waits for the server-side fetch (watcher input)
+        self._watching: dict[str, DownloadJob] = {}
+        # job_id → (last observed server-side size, monotonic time), for speed
+        self._fetch_prev: dict[str, tuple[int, float]] = {}
+        self._watcher_task: asyncio.Task | None = None
+        self._prefetch_sem: asyncio.Semaphore | None = (
+            asyncio.Semaphore(settings.prefetch_slots)
+            if settings.prefetch and settings.prefetch_slots > 0
+            else None
+        )
+        self._url = UrlDownloader(settings) if settings.links_enabled else None
         if self._local_mode:
             if self.LOCAL_FILES_DIR.is_dir():
                 logger.info(
@@ -152,6 +189,17 @@ class DownloadEngine:
         return self._http
 
     async def aclose(self) -> None:
+        for task in list(self._inflight.values()):
+            task.cancel()
+        if self._inflight:
+            await asyncio.gather(*self._inflight.values(), return_exceptions=True)
+            self._inflight.clear()
+        if self._watcher_task and not self._watcher_task.done():
+            self._watcher_task.cancel()
+            with contextlib.suppress(Exception):
+                await asyncio.gather(self._watcher_task, return_exceptions=True)
+        if self._url is not None:
+            await self._url.aclose()
         if self._http and not self._http.closed:
             await self._http.close()
 
@@ -161,10 +209,26 @@ class DownloadEngine:
         """Absolute download URL for the cloud Bot API."""
         return self._bot.session.api.file_url(self._bot.token, file_path)
 
+    async def probe_url(self, url: str):
+        """Probe a direct link (name / size / range support) before queueing."""
+        if self._url is None:
+            raise DownloadError(
+                "link downloads are disabled on this server (LINKS_ENABLED=false)"
+            )
+        return await self._url.probe(url)
+
     def _redact(self, text: str) -> str:
         """Mask the bot token so errors stay safe for logs and chat receipts."""
         token = getattr(self._bot, "token", "")
         return text.replace(token, "***") if token else text
+
+    def _scrub(self, job: DownloadJob, text: str) -> str:
+        """Redact secrets from error text: the bot token, and the query
+        string of any URL (signed links carry tokens in theirs)."""
+        text = self._redact(text)
+        if job.media_type == "url":
+            text = _URL_SCRUB_RE.sub(lambda m: strip_query(m.group(0)), text)
+        return text
 
     async def resolve_file_path(
         self, file_id: str, job: DownloadJob | None = None
@@ -180,6 +244,10 @@ class DownloadEngine:
         (bounded by a 24h hard cap). Real network errors still propagate to
         the normal retry/backoff machinery, and the whole wait races the
         job's cancel event so ``/cancel`` aborts promptly.
+
+        All callers for the same ``file_id`` share ONE underlying getFile
+        task (prefetcher and workers), so a file is only ever asked for
+        once at a time.
         """
         cached = self._cache.get(file_id)
         if cached:
@@ -194,20 +262,52 @@ class DownloadEngine:
             )
         if job is not None:
             job.waiting_since = time.monotonic()
+            self._watching[job.job_id] = job
+            self._ensure_watcher()
         try:
-            file = await self._get_file_with_reissue(file_id, job)
+            file = await self._race_cancel(await self._fetch_task(file_id), job)
         finally:
             if job is not None:
                 job.waiting_since = None
+                self._watching.pop(job.job_id, None)
+                self._fetch_prev.pop(job.job_id, None)
+                job.fetch_done = None
+                job.fetch_total = None
+                job.fetch_speed = 0.0
         path = file.file_path
         if not path:
             raise DownloadError("getFile returned an empty file_path")
         self._cache.put(file_id, path)
         return path
 
-    async def _get_file_with_reissue(
-        self, file_id: str, job: DownloadJob | None
-    ):
+    async def _fetch_task(self, file_id: str) -> asyncio.Task:
+        """The ONE shared getFile task per file_id (create or join)."""
+        task = self._inflight.get(file_id)
+        if task is not None and not task.done():
+            return task
+        if task is not None:
+            # A finished task (success is cached, failure will be retried) —
+            # consume its outcome so asyncio logs no warnings, then replace.
+            if not task.cancelled():
+                with contextlib.suppress(Exception):
+                    task.exception()
+        task = asyncio.create_task(
+            self._fetch_with_reissue(file_id),
+            name=f"tellybee-fetch-{file_id[:12]}",
+        )
+
+        def _cleanup(done: asyncio.Task, fid: str = file_id) -> None:
+            if self._inflight.get(fid) is done:
+                self._inflight.pop(fid, None)
+            if not done.cancelled():
+                with contextlib.suppress(Exception):
+                    done.exception()
+
+        task.add_done_callback(_cleanup)
+        self._inflight[file_id] = task
+        return task
+
+    async def _fetch_with_reissue(self, file_id: str):
         """getFile, re-issuing on client-side timeouts (local mode only).
 
         Cloud getFile is a quick metadata call → session default (60s), no
@@ -215,6 +315,11 @@ class DownloadEngine:
         allow minutes per call (``GETFILE_TIMEOUT``), and when the call times
         out just ask again — the server attaches the new query to the SAME
         in-flight download and answers it on completion.
+
+        The task is deliberately never cancelled from the outside: waiters
+        race their own cancel events around it (see ``_race_cancel``), so one
+        waiter bailing out never kills the fetch for the others. Successful
+        results are cached here so every future waiter is instant.
         """
         deadline = (
             time.monotonic() + _GETFILE_TOTAL_BUDGET if self._local_mode else None
@@ -225,7 +330,9 @@ class DownloadEngine:
                 round(self._settings.getfile_timeout) if self._local_mode else None
             )
             try:
-                return await self._get_file(file_id, job, request_timeout)
+                file = await self._bot.get_file(
+                    file_id, request_timeout=request_timeout
+                )
             except TelegramNetworkError as err:
                 timed_out = "timeout" in str(err).lower()
                 if (
@@ -236,46 +343,207 @@ class DownloadEngine:
                     raise  # real error, cloud mode, or out of budget → retries
                 attempt += 1
                 logger.info(
-                    "job #%s: the local Bot API server is still fetching the file "
+                    "the local Bot API server is still fetching file %s "
                     "(getFile timed out client-side after %ss, wait #%d) — asking "
                     "again; the server keeps its download progress",
-                    job.job_id if job else file_id[:12],
+                    file_id[:12],
                     round(self._settings.getfile_timeout),
                     attempt,
                 )
+            else:
+                if file.file_path:
+                    self._cache.put(file_id, file.file_path)
+                return file
 
-    async def _get_file(
-        self, file_id: str, job: DownloadJob | None, request_timeout: int | None
+    async def _race_cancel(
+        self, task: asyncio.Task, job: DownloadJob | None
     ):
-        """Call bot.get_file, racing it against the job's cancel event.
+        """Await the shared fetch task, aborting early if THIS job is cancelled.
 
         Without this race a ``/cancel`` issued while the local server is
         still fetching the file would be ignored until the transfer
         finished (up to ``GETFILE_TIMEOUT`` later) — the job would then
-        complete and deliver its receipt despite being cancelled.
+        complete and deliver its receipt despite being cancelled. The
+        shared task itself keeps running for any other waiters.
         """
-        get_task = asyncio.ensure_future(
-            self._bot.get_file(file_id, request_timeout=request_timeout)
-        )
         if job is None:
-            return await get_task
-        try:
-            while not job.is_cancelled():
-                done, _ = await asyncio.wait(
-                    {get_task}, timeout=_GETFILE_CANCEL_POLL
+            return await task
+        while not job.is_cancelled():
+            done, _ = await asyncio.wait({task}, timeout=_GETFILE_CANCEL_POLL)
+            if done:
+                return task.result()
+        raise JobCancelled(job.job_id)
+
+    # ── prefetch (local mode) ──────────────────────────────────────────────
+
+    async def prefetch(self, job: DownloadJob) -> None:
+        """Start the server-side fetch for a queued job right away.
+
+        The server-side download IS the slow part of local mode, and workers
+        only trigger it when they pick a job — with a queue of N big files
+        the server would otherwise idle between worker slots. Prefetching
+        keeps the local Bot API server busy while workers copy whatever is
+        already finished. Bounded by ``PREFETCH_SLOTS``; failures are logged
+        and left to the worker's retry machinery.
+
+        Pausing the queue does NOT pause prefetch: the server-side cache
+        filling up is harmless and makes /resume instant.
+        """
+        if self._prefetch_sem is None or not self._local_mode:
+            return
+        if self._cache.get(job.file_id):
+            return
+        async with self._prefetch_sem:
+            if (
+                job.is_cancelled()
+                or job.status not in (JobStatus.QUEUED, JobStatus.RUNNING)
+                or self._cache.get(job.file_id)
+            ):
+                return
+            logger.info(
+                "prefetch: asking the local Bot API server to start fetching "
+                "job #%s (%s) ahead of time",
+                job.job_id, job.rel_path,
+            )
+            try:
+                await self.resolve_file_path(job.file_id, job=job)
+            except JobCancelled:
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 — the worker retries properly
+                logger.info(
+                    "prefetch for job #%s gave up (%s: %s) — the worker will retry",
+                    job.job_id, type(err).__name__, self._redact(str(err)),
                 )
-                if done:
-                    return get_task.result()
-            raise JobCancelled(job.job_id)
-        finally:
-            if not get_task.done():
-                get_task.cancel()
-            if get_task.done() and not get_task.cancelled():
-                # Retrieve a pending exception so asyncio logs no
-                # "exception was never retrieved" warning for abandoned
-                # tasks (synchronous — safe during cancellation unwinding).
-                with contextlib.suppress(Exception):
-                    get_task.exception()
+
+    # ── fetch-progress watcher (local mode) ─────────────────────────────────
+
+    def _ensure_watcher(self) -> None:
+        """Start the volume watcher lazily; it idles cheaply when unused."""
+        if not self._local_mode:
+            return
+        if self._watcher_task is None or self._watcher_task.done():
+            self._watcher_task = asyncio.create_task(
+                self._watch_fetches(), name="tellybee-fetch-watcher"
+            )
+
+    async def _watch_fetches(self) -> None:
+        """Poll the server's storage and update waiting jobs' fetch progress.
+
+        TDLib writes received files directly at their final path with
+        ``pwrite`` at part offsets, so a file's size grows monotonically
+        while the server is still fetching it — a cheap ``stat`` scan of
+        recently-modified files gives real progress for the otherwise opaque
+        getFile wait. Runs the scan in a worker thread; paths under the
+        token directory are never logged (they contain the bot token).
+        """
+        interval = max(0.2, self._settings.fetch_watch_interval)
+        while True:
+            await asyncio.sleep(interval)
+            jobs = [job for job in self._watching.values() if job.file_size]
+            if not jobs:
+                continue
+            try:
+                candidates = await asyncio.to_thread(self._scan_server_files)
+            except OSError:
+                continue
+            if not candidates:
+                for job in jobs:
+                    job.fetch_done = None
+                    job.fetch_speed = 0.0
+                continue
+            self._match_fetch_progress(jobs, candidates)
+
+    def _scan_server_files(self) -> list[tuple[int, float, str]]:
+        """Snapshot of recently-modified files in the server's storage.
+
+        Returns ``(size, mtime, path)`` tuples for files modified within
+        ``_FETCH_SCAN_MAX_AGE``. Blocking (stat storm) — always call via
+        ``asyncio.to_thread``. Paths are internal and must never be logged.
+        """
+        root = Path(self.LOCAL_FILES_DIR) / (getattr(self._bot, "token", "") or "")
+        if not root.is_dir():
+            return []
+        now = time.time()
+        results: list[tuple[int, float, str]] = []
+        for dirpath, _dirs, files in os.walk(root):
+            depth = dirpath[len(str(root)) :].count(os.sep)
+            if depth >= 4:
+                continue
+            for name in files:
+                path = os.path.join(dirpath, name)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                if st.st_mtime < now - _FETCH_SCAN_MAX_AGE:
+                    continue
+                results.append((st.st_size, st.st_mtime, path))
+        return results
+
+    def _match_fetch_progress(
+        self, jobs: list[DownloadJob], candidates: list[tuple[int, float, str]]
+    ) -> None:
+        """Pair growing server-side files with waiting jobs by expected size.
+
+        Sticky first (a job keeps its matched file while it still fits), then
+        largest-expected-first greedy matching for the rest. Sizes above the
+        expected size (plus tolerance) can never be the job's file still
+        downloading — those are already-complete cache entries.
+        """
+        now = time.monotonic()
+        used: set[str] = set()
+        matched: dict[str, tuple[int, float, str]] = {}
+        # Pass 1: sticky rematching — keeps the display stable.
+        for job in sorted(jobs, key=lambda j: -(j.file_size or 0)):
+            path = job.fetch_path
+            if not path:
+                continue
+            hit = next((c for c in candidates if c[2] == path), None)
+            if (
+                hit is not None
+                and hit[2] not in used
+                and hit[0] <= (job.file_size or 0) + _FETCH_SIZE_TOLERANCE
+            ):
+                matched[job.job_id] = hit
+                used.add(hit[2])
+        # Pass 2: fresh matches — biggest expected size picks first.
+        for job in sorted(jobs, key=lambda j: -(j.file_size or 0)):
+            if job.job_id in matched:
+                continue
+            expected = job.file_size or 0
+            best: tuple[int, float, str] | None = None
+            for size, _mtime, path in candidates:
+                if path in used or size > expected + _FETCH_SIZE_TOLERANCE:
+                    continue
+                if best is None or size > best[0]:
+                    best = (size, _mtime, path)
+            if best is not None:
+                matched[job.job_id] = best
+                used.add(best[2])
+        for job in jobs:
+            hit = matched.get(job.job_id)
+            if hit is None:
+                job.fetch_done = None
+                job.fetch_speed = 0.0
+                job.fetch_path = None
+                continue
+            size, _mtime, path = hit
+            prev = self._fetch_prev.get(job.job_id)
+            if prev is not None and now > prev[1]:
+                dt = now - prev[1]
+                inst = max(0.0, (size - prev[0]) / dt)
+                job.fetch_speed = (
+                    inst if job.fetch_speed <= 0
+                    else 0.7 * job.fetch_speed + 0.3 * inst
+                )
+            self._fetch_prev[job.job_id] = (size, now)
+            job.fetch_path = path
+            job.fetch_total = job.file_size
+            job.fetch_done = size
 
     # ── main entrypoint ─────────────────────────────────────────────────────
 
@@ -291,12 +559,7 @@ class DownloadEngine:
             except JobCancelled:
                 self._cleanup_part(job)
                 raise
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-                TelegramNetworkError,
-                OSError,
-            ) as err:
+            except (TimeoutError, aiohttp.ClientError, TelegramNetworkError, OSError) as err:
                 last_error = err
                 self._cleanup_part(job)
                 if attempt < attempts:
@@ -304,19 +567,30 @@ class DownloadEngine:
                     logger.warning(
                         "job #%s attempt %d/%d failed (%s: %s); retrying in %.1fs",
                         job.job_id, attempt, attempts, type(err).__name__,
-                        self._redact(str(err)), delay,
+                        self._scrub(job, str(err)), delay,
                     )
                     await self._sleep_cancellable(job, delay)
                 else:
                     logger.error(
                         "job #%s failed after %d attempts: %s",
-                        job.job_id, attempts, self._redact(str(err)),
+                        job.job_id, attempts, self._scrub(job, str(err)),
                     )
-        raise DownloadError(self._redact(str(last_error or "download failed")))
+        raise DownloadError(self._scrub(job, str(last_error or "download failed")))
 
     async def _attempt(self, job: DownloadJob) -> EngineResult:
         started = time.monotonic()
         job.started_at = started
+        if job.media_type == "url":
+            # Direct-link download: bypasses Telegram entirely.
+            if self._url is None:
+                raise DownloadError(
+                    "link downloads are disabled on this server (LINKS_ENABLED=false)"
+                )
+            try:
+                return await self._url.download(job, started)
+            except UrlRejected as err:
+                # Non-retryable (bad URL, HTTP 4xx, size cap, SSRF block…).
+                raise DownloadError(str(err)) from err
         file_path = await self.resolve_file_path(job.file_id, job=job)
         if self._local_mode and file_path.startswith("/"):
             # Local Bot API server: getFile returns an absolute path inside
@@ -360,7 +634,7 @@ class DownloadEngine:
             # ENOSPC never resolves on retry — fail fast with the remedy.
             part_file.unlink(missing_ok=True)
             if err.errno == errno.ENOSPC:
-                raise self._disk_full_error(err) from err
+                raise disk_full_error(err) from err
             raise
         except BaseException:
             part_file.unlink(missing_ok=True)
@@ -416,13 +690,11 @@ class DownloadEngine:
 
     @staticmethod
     def _disk_full_error(err: OSError) -> DownloadError:
-        """ENOSPC is as non-retryable as EACCES — make the remedy explicit."""
-        return DownloadError(
-            f"{err} — the downloads volume is out of free space. A file needs "
-            "roughly its own size free on the downloads disk on top of the "
-            "Bot API server's cache; free space (also check 'docker system df' "
-            "for the botapi-data volume) or move DOWNLOAD_DIR to a bigger disk"
-        )
+        """ENOSPC is as non-retryable as EACCES — make the remedy explicit.
+
+        Shared with the URL downloader via ``app.services.urlfetch``.
+        """
+        return disk_full_error(err)
 
     async def _copy_local_file_inner(
         self, job: DownloadJob, server_path: str, started: float
@@ -518,5 +790,5 @@ class DownloadEngine:
         """Sleep while staying responsive to cancellation."""
         try:
             await asyncio.wait_for(job.cancel_event.wait(), timeout=delay)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass

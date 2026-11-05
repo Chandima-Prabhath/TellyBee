@@ -13,7 +13,7 @@ control, a durable SQLite ledger, and full queue observability. It must stay
 **modern, fast, stable** — in that order of priority for feature decisions:
 stability beats speed, speed beats cleverness.
 
-- **Stack**: Python 3.10+ (runtime images use 3.12), aiogram 3.31+,
+- **Stack**: Python 3.12+, aiogram 3.31+,
   aiohttp, aiosqlite, pydantic v2 + pydantic-settings.
 - **No ORM** — plain SQL in `app/db.py`. Do not introduce one.
 - **Single process** — the queue is in-process `asyncio`. Do not add
@@ -87,9 +87,10 @@ Outer middleware execution order = registration order in
    `album == [message]`.
 
 Router inclusion order in `app/handlers/__init__.py`: `common` → `admin`
-(guarded by `IsAdmin` router-level filter) → `media` (broad media filter
-+ catch-all fallback). Command handlers must stay before the media
-catch-all.
+(guarded by `IsAdmin` router-level filter) → `links` (`/link` + URL
+auto-detect on `F.text`; must precede the media catch-all so links in
+plain text are consumed there) → `media` (broad media filter + catch-all
+fallback). Command handlers must stay before the media catch-all.
 
 Handler dependency injection: the `Dispatcher(settings=…, db=…, manager=…)`
 workflow data is injected by parameter name — handlers declare
@@ -107,13 +108,21 @@ workflow data is injected by parameter name — handlers declare
 - Shutdown: set `_stopping`, `resume()`, drain pending (mark CANCELLED),
   push one `_STOP` sentinel per worker, wait the grace timeout, then
   force-cancel stragglers. Idle workers exit on the sentinel.
-- Cancellation: pending → `_cancel_flags` set, finalized when dequeued;
-  running → `job.cancel_event`, the engine aborts at the next chunk
-  boundary and raises `JobCancelled`.
+- Cancellation: pending → `_cancel_flags` set **and `cancel_event` tripped**
+  (aborts any in-flight prefetch for that queued job), finalized when
+  dequeued; running → `job.cancel_event`, the engine aborts at the next
+  chunk boundary (or the next 1s poll while parked in `getFile`) and raises
+  `JobCancelled`.
+- `submit()` also schedules a **prefetch task** (`engine.prefetch(job)`, local
+  mode only, semaphore-bounded by `PREFETCH_SLOTS`) — the task races the
+  job's cancel event and is cancelled wholesale at shutdown, BEFORE the
+  workers drain, so the server stops being asked for new files first.
 - The notifier groups jobs by `album_key or f"job:{job_id}"`; a group owns
   at most one chat message, created lazily only when
-  `expected_bytes >= PROGRESS_MIN_BYTES`, edited at most once per
-  `PROGRESS_EDIT_INTERVAL`, finalized into exactly one receipt.
+  `expected_bytes >= PROGRESS_MIN_BYTES` **and a job is running or fetching
+  (waiting in `getFile` — with prefetch that happens while still QUEUED)**,
+  edited at most once per `PROGRESS_EDIT_INTERVAL`, finalized into exactly
+  one receipt.
 
 ## Adding things (checklists)
 
@@ -192,8 +201,47 @@ models — see `tests/test_media_types.py` for the pattern.
   re-issues `getFile` (up to a 24h budget) WITHOUT burning the job's retry
   budget — the server attaches the new query to the same in-flight
   download. The wait is raced against the job's cancel event
-  (`_get_file`, 1s poll) so `/cancel` stays responsive, and
-  `job.waiting_since` drives the notifier's "Telegram is preparing…" phase.
+  (`_race_cancel`, 1s poll) so `/cancel` stays responsive, and
+  `job.waiting_since` drives the notifier's "fetching from Telegram" phase.
+- **TDLib's per-file download throughput is resource-capped, not
+  priority-capped.** Verified against TDLib sources:
+  `FileDownloadManager` keeps `max_download_resource_limit_ = 1 << 21`
+  (**2 MiB in-flight per (DC, size-class) pool**) and multiplies it **×8**
+  only when the TDLib option `session_count` > 1 (or premium — impossible
+  for bots). `do_get_file` uses `downloadFile(priority=1)` but priority
+  only orders *competing* files; a single file already gets its whole
+  per-DC pool. Consequences: (a) many files on one DC split the same pool
+  (prefetching helps wall-clock only via pipelining + cross-DC batches);
+  (b) the only single-file speed lever is `session_count`, which bots
+  cannot set via the Bot API — hence the optional patched-server build in
+  `deploy/botapi-fast/Dockerfile` (injects `setOption("session_count", N)`
+  before `setTdlibParameters`, where TDLib requires it to be set).
+- **getFile requests are shared per file_id** (`_fetch_task` /
+  `_inflight`): the prefetcher and any workers awaiting the same file join
+  ONE task; never cancel that task from a waiter — each waiter races its
+  own job's cancel event instead (`_race_cancel`). Cancellation of one job
+  must not kill the server-side fetch another job still needs.
+- **The fetch-progress watcher never logs paths under the server volume** —
+  `<LOCAL_FILES_DIR>/<bot-token>/…` embeds the token. Only sizes/speeds are
+  safe to log. Matching jobs to growing files is by expected size
+  (sticky-first, largest-expected-first); files bigger than expected are
+  completed cache entries, never the match.
+- **URL jobs reuse the Telegram job shape**: `media_type="url"`,
+  `file_id=<final URL>`, `file_unique_id=sha256(final_url)[:32]`. The URL
+  downloader (`app/services/urlfetch.py`) runs INSIDE the engine's normal
+  retry/backoff/atomic-rename machinery — only `UrlRejected` (bad URL,
+  HTTP 4xx, size cap, SSRF block) short-circuits to a non-retryable
+  `DownloadError`. SSRF protection is DUAL-LAYER: aiohttp's connector
+  *skips the resolver for IP-literal hosts*, so `validate_url` checks those
+  directly, while `_SafeResolver` guards DNS names at connect time
+  (covers redirects + rebinding, no TOCTOU gap). Error text shown to users
+  is query-string-scrubbed (`strip_query`) because signed URLs carry
+  secrets in the query.
+- **Ranged multi-connection downloads write through one shared fd** with
+  positional `os.pwrite` (executor) into a preallocated `.part` — parts are
+  safe to run concurrently, each resuming itself from its current offset.
+  SHA-256 for ranged downloads is computed by one sequential re-read after
+  the parts finish (parts arrive out of order; digests cannot be merged).
 - **The 2GB figure is an UPLOAD cap, not a download cap.** Verified against
   10.3 sources: `MAX_DOWNLOAD_FILE_SIZE = 20MB` and BOTH download-size
   checks are guarded by `!parameters_->local_mode_` — in local mode the

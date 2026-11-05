@@ -192,3 +192,52 @@ def test_getfile_timeout_bounds():
         Settings(bot_token=VALID_TOKEN, api_base="http://botapi:8081", getfile_timeout=30)
     with pytest.raises(ValidationError, match="GETFILE_TIMEOUT"):
         Settings(bot_token=VALID_TOKEN, api_base="http://botapi:8081", getfile_timeout=100000)
+
+
+# ── Prefetch & direct-link settings (0.3.0) ─────────────────────────────────
+
+
+def test_prefetch_settings_defaults_and_bounds():
+    s = Settings(bot_token=VALID_TOKEN)
+    assert s.prefetch is True
+    assert s.prefetch_slots == 6
+    assert s.fetch_watch_interval == 1.5
+
+    with pytest.raises(ValidationError, match="PREFETCH_SLOTS"):
+        Settings(bot_token=VALID_TOKEN, prefetch_slots=99)
+    with pytest.raises(ValidationError, match="FETCH_WATCH_INTERVAL"):
+        Settings(bot_token=VALID_TOKEN, fetch_watch_interval=0.05)
+
+
+def test_prefetch_slots_zero_disables():
+    s = Settings(bot_token=VALID_TOKEN, prefetch_slots=0)
+    assert s.prefetch_slots == 0
+
+
+def test_link_settings_defaults_and_bounds():
+    s = Settings(bot_token=VALID_TOKEN)
+    assert s.links_enabled is True
+    assert s.link_connections == 4
+    assert s.link_max_size == 0  # uncapped
+
+    with pytest.raises(ValidationError, match="LINK_CONNECTIONS"):
+        Settings(bot_token=VALID_TOKEN, link_connections=0)
+    with pytest.raises(ValidationError, match="LINK_CONNECTIONS"):
+        Settings(bot_token=VALID_TOKEN, link_connections=32)
+
+
+def test_link_max_size_accepts_human_and_blank():
+    s = Settings(bot_token=VALID_TOKEN, link_max_size="10GB")
+    assert s.link_max_size == 10 * 1024**3
+    # an empty .env line means "uncapped", not a parse error
+    blank = Settings(bot_token=VALID_TOKEN, link_max_size="")
+    assert blank.link_max_size == 0
+
+
+def test_summary_reports_new_toggles():
+    s = Settings(bot_token=VALID_TOKEN)
+    assert "prefetch=True" in s.summary()
+    assert "links=True" in s.summary()
+    off = Settings(bot_token=VALID_TOKEN, prefetch=False, links_enabled=False)
+    assert "prefetch=False" in off.summary()
+    assert "links=False" in off.summary()

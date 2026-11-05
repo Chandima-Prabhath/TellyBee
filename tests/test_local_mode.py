@@ -308,6 +308,12 @@ async def test_cancel_during_slow_getfile_aborts_promptly(
 
     Without the cancel race the job would keep running — and eventually
     deliver its receipt — up to GETFILE_TIMEOUT after the user cancelled.
+
+    Since v0.3 the underlying getFile task is SHARED per file_id and is
+    deliberately NOT cancelled by one waiter bailing out (another waiter
+    may still need the fetch). The cancelled job must still abort within a
+    poll tick; the shared request keeps running in the background and is
+    reaped silently when it eventually finishes.
     """
     botapi = tmp_path / "botapi"
     botapi.mkdir()
@@ -335,9 +341,12 @@ async def test_cancel_during_slow_getfile_aborts_promptly(
     elapsed = time.monotonic() - t0
 
     await canceller
-    await asyncio.sleep(0.05)  # let the aborted request unwind its CancelledError
+    await asyncio.sleep(0.05)
     assert elapsed < 5.0  # detected within one poll tick, not 30s later
-    assert bot.interrupted  # the in-flight getFile request was aborted
+    # The shared request is left alive for other waiters (NOT interrupted)…
+    assert not bot.interrupted
+    # …and the engine still cleans it up on aclose without warnings.
+    await engine.aclose()
     assert not Path(job.target_path + ".part").exists()  # noqa: ASYNC240 — test assertion
 
 

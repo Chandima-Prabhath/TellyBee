@@ -16,14 +16,21 @@ Built on **aiogram 3** (fully async), **Python 3.12**, and a
 - 📥 **Downloads everything Telegram can send** — photo, video, document,
   audio, voice, video note, sticker, animation, and **media-group albums**
   (saved as one batch, one summary receipt).
+- 🌐 **Direct link downloads** — send any http(s) URL (or `/link <url>`) and
+  it is fetched straight from the source server to your disk with
+  **parallel range connections** — no Telegram size limits, SSRF-guarded.
 - ⚡ **Fast streaming engine** — constant memory usage, chunked transfer
-  (configurable), SHA-256 hashing on the fly, `getFile` result caching.
+  (configurable), SHA-256 hashing on the fly, `getFile` result caching, and
+  **server-side prefetching** so the local Bot API server downloads ahead
+  while workers copy finished files.
 - 🛡 **Stable by design** — atomic `.part` → rename writes (no half-files),
   retries with exponential backoff + jitter, per-job error isolation
   (one bad file never stops the queue), graceful drain on shutdown.
 - 🧮 **Live queue monitoring from inside the bot** — `/queue` shows active
   transfers with progress bars, pending jobs, worker utilization, and
-  session counters; big downloads get an auto-updating progress message.
+  session counters; big downloads get an auto-updating progress message —
+  including **real progress while the local server is still fetching** the
+  file from Telegram (watched on the shared volume).
 - 🎛 **Two-tier access control** — env-seeded admins & users, plus runtime
   `/allow` / `/disallow` / `/users` management persisted in SQLite.
 - 🗂 **Flexible storage layout** — configurable folder template like
@@ -33,7 +40,7 @@ Built on **aiogram 3** (fully async), **Python 3.12**, and a
   size limits with friendly rejections.
 - ❤️ **Ops-friendly** — HTTP `/healthz` endpoint with queue metrics
   (docker healthcheck built in), text or JSON logs, polling *or* webhook
-  mode, optional local Bot API server support for **2 GB files**.
+  mode, optional local Bot API server support for **files up to 4 GB**.
 
 ---
 
@@ -111,6 +118,7 @@ python -m app.main --check
 |---|---|---|
 | `/start` | everyone | welcome card + your access level |
 | `/help` | everyone | usage guide, limits, storage layout |
+| `/link <url>` | everyone | download a direct http(s) link (or just send the URL as text) |
 | `/status` | everyone | your 10 most recent downloads |
 | `/queue` | everyone* | live queue monitor (*users see only their own jobs) |
 | `/cancel <id>` | everyone* | cancel a running or pending download |
@@ -128,6 +136,17 @@ python -m app.main --check
 ⬇️ Downloading clip.mp4
 ▰▰▰▰▰▰▱▱▱▱ 52%
 14.2 / 27.4 MB • 3.4 MB/s • ETA 4s
+```
+
+With a local Bot API server, big first-time downloads first show the
+server-side fetch (real progress, watched on the shared volume) before the
+fast local copy takes over:
+
+```
+⬇️ Downloading movie.mkv
+📡 Fetching from Telegram
+▰▰▰▰▱▱▱▱▱▱ 41%
+320 / 780 MB • 2.1 MB/s • ETA 3m 39s
 ```
 
 ```
@@ -158,8 +177,14 @@ Everything is env-driven (`.env` file supported); human-friendly values like
 | `DOWNLOAD_RETRIES` | `3` | attempts per file |
 | `DOWNLOAD_TIMEOUT` | `900` | per-file hard timeout (seconds, cloud transfer) |
 | `GETFILE_TIMEOUT` | `1800` | how long `getFile` may wait while the local server fetches a big file (seconds) |
+| `PREFETCH` | `true` | start fetching queued files on the local server immediately (local mode) |
+| `PREFETCH_SLOTS` | `6` | max simultaneous server-side fetches (0 disables) |
+| `FETCH_WATCH_INTERVAL` | `1.5` | seconds between fetch-progress volume scans |
 | `CHUNK_SIZE` | `256KB` | streaming chunk size |
 | `MAX_FILE_SIZE` | `20MB` | reject bigger files (≤ 20MB cloud · ≤ 4000MB with a local Bot API server) |
+| `LINKS_ENABLED` | `true` | allow direct http(s) link downloads |
+| `LINK_CONNECTIONS` | `4` | parallel range connections per link (1–16) |
+| `LINK_MAX_SIZE` | `0` | per-link size cap, `0` = uncapped (e.g. `10GB`) |
 | `ALLOWED_TYPES` | *(all)* | only accept these media types |
 | `BLOCKED_TYPES` | *(none)* | never accept these media types |
 | `PROGRESS_MIN_BYTES` | `2MB` | live progress message threshold |
@@ -180,7 +205,7 @@ Everything is env-driven (`.env` file supported); human-friendly values like
 Telegram ──updates──► aiogram Dispatcher
                         │  middleware: throttle → auth → album-buffer
                         ▼
-                      Routers (common → admin → media)
+                      Routers (common → admin → links → media)
                         │  builds DownloadJob (template + sanitized path)
                         ▼
                  DownloadManager (priority queue + N workers)
@@ -256,10 +281,13 @@ Notes:
   can take hours). The bot waits it out (`GETFILE_TIMEOUT` per request,
   automatically re-asking for up to 24 hours) and stays responsive to
   `/cancel` in the meantime; timeouts never burn the retry budget because
-  the server keeps its download progress. Re-sending a file that is already
-  in the `botapi-data` volume is near-instant — and since v0.2.0 re-sending
-  a file that is already in `./downloads` is skipped outright (duplicate
-  detection by `file_unique_id`).
+  the server keeps its download progress. While it waits, the engine
+  **watches the server's shared volume** and shows real fetch progress
+  (% / speed / ETA) in chat instead of a frozen bar. Re-sending a file that
+  is already in the `botapi-data` volume is near-instant — and since v0.2.0
+  re-sending a file that is already in `./downloads` is skipped outright
+  (duplicate detection by `file_unique_id`).
+
 - **Why the `botapi` service needs its custom `entrypoint`:** the Bot API
   server drops to its own unprivileged user (uid 101 in the stock image)
   and writes every received file with **owner-only permissions** — TDLib
@@ -289,6 +317,64 @@ Notes:
 - Don't want the local server? Comment out the whole `botapi` service, the
   `depends_on` entry **and** the `botapi-data` volume mount above, remove
   `API_BASE` from `.env`, and set `MAX_FILE_SIZE=20MB`.
+
+### 🏎 Speeding up big-file downloads
+
+Three layers, all free:
+
+1. **Prefetching (on by default).** The slow part of local mode is the
+   server downloading from Telegram — normally that only starts when a
+   worker picks the job. TellyBee instead asks the local server to start
+   fetching every queued file immediately (`PREFETCH=true`, up to
+   `PREFETCH_SLOTS=6` at once), so the server keeps downloading while
+   workers copy finished files. Batches that span different Telegram DCs
+   genuinely parallelize (each DC has its own pool); a batch on one DC
+   finishes in roughly the same total time but stays pipelined.
+2. **Your host's link and disk.** The fetch runs at whatever the ARM box's
+   internet connection allows, and the `botapi-data` volume must keep up
+   with writes — an SD card can throttle a Pi-class host; USB SSDs help.
+3. **The optional `botapi-fast` build (biggest single-file win).** TDLib
+   keeps only **~2 MiB of one file in flight per Telegram DC**
+   (`max_download_resource_limit_ = 1 << 21` in TDLib's
+   `FileDownloadManager.h`) — on a high-latency link that alone caps a
+   single big file at roughly `2 MiB / RTT`. TDLib raises the limit **8×**
+   when its `session_count` option is > 1, but the stock server never sets
+   it and the Bot API gives bots no way to set TDLib options. The
+   `deploy/botapi-fast/Dockerfile` builds a patched server that sets
+   `session_count` before authorization — swap the `botapi` service from
+   `image:` to that `build:` (see the commented block in
+   `docker-compose.yml.example`). First build compiles TDLib (hours on
+   ARM, then cached); afterwards single-file downloads typically run
+   several times faster until your bandwidth becomes the ceiling. Keep the
+   custom entrypoint either way.
+
+---
+
+## 🌐 Direct link downloads
+
+Besides Telegram files, TellyBee can fetch **any http(s) URL** straight to
+the downloads folder — Telegram is not involved, so the Bot API's limits do
+not apply; the transfer runs at your host's connection speed.
+
+- Send a message containing a link, or use `/link <url>` (up to 5 links per
+  message). Files land under the usual template with `{type}` = `url`, get
+  the same receipts, progress messages, `/cancel`, `/stats` rows and
+  duplicate detection (by the final URL) as Telegram files.
+- **Multi-connection:** servers that support byte ranges are downloaded over
+  `LINK_CONNECTIONS` (default 4) parallel connections, which usually
+  saturates the host's bandwidth where a single stream would not; servers
+  without range support fall back to one stream automatically. Each ranged
+  part resumes itself from its current offset on transient errors.
+- **Safety:** only `http`/`https` URLs, redirects followed but re-checked,
+  and an SSRF guard inside the HTTP connector **refuses to connect to
+  private / loopback / link-local / reserved addresses** — a crafted link
+  can never reach your LAN, the docker network or cloud metadata endpoints.
+  URLs with embedded credentials (`user:pass@…`) are rejected, and signed
+  query strings are stripped from any error text shown in chat/logs.
+- **Limits:** `LINK_MAX_SIZE` (default uncapped) caps the accepted size;
+  unknown sizes are enforced mid-transfer; the queue's disk-headroom guard
+  and ENOSPC fail-fast apply exactly as for Telegram files. Disable the
+  whole feature with `LINKS_ENABLED=false`.
 
 ---
 
@@ -323,7 +409,11 @@ before contributing (humans and AI assistants alike).
 | `ApiTokenValidationError` in logs | Token revoked/regenerated — update `.env` and restart. |
 | Files > 20 MB fail | Expected with the standard Bot API — see the *Big files* section. |
 | Files > 2 GB rejected / do bigger files work? | Yes — with the local Bot API server, downloads have **no size limit** (4 GB is Telegram's own per-file ceiling). Set `MAX_FILE_SIZE=4000MB` and `API_BASE=http://botapi:8081`. A >2 GB file can only originate from a Premium upload — forwarding one to the bot as a free user works fine. |
-| `…exceeds 4.0 GB limit` on intake | Telegram's absolute per-file maximum (Premium uploads cap at 4 GB) — nothing larger exists to download. |
+| Link download says *“the host resolves to a private or otherwise blocked address”* | The SSRF guard refused an internal/loopback/reserved IP — by design. Link the file via its public URL, or (deliberately, on trusted networks only) host it on a public address. |
+| Link download fails with *“the server answered HTTP 404/403…”* | The server rejected the request (expired signed URL, auth required, gone). Nothing retryable — fetch a fresh link. |
+| Progress message stuck at “Telegram is preparing…” with no % | The volume watcher could not match a growing file in the server's storage (e.g. the job's size is unknown). Display-only — the download itself is unaffected. |
+| Big files download slowly | See *Speeding up big-file downloads* — prefetching is on by default; the `botapi-fast` build multiplies single-file speed; check the host's link/disk. |
+| `…exceeds 4.0 GB limit` on intake | Telegram's absolute per-file maximum (Premium uploads cap at 4 GB) — nothing larger exists to download. Use a direct link instead. |
 | Queue full rejections | Raise `MAX_QUEUE_SIZE` and/or `DOWNLOAD_CONCURRENCY`. |
 | Healthcheck failing | `curl http://localhost:8080/healthz` — if the bot is crash-looping, check `docker compose logs`. |
 

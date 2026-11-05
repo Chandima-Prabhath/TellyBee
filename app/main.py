@@ -125,7 +125,7 @@ async def _poll_forever(
         try:
             await asyncio.wait_for(stop.wait(), timeout=delay)
             return
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         delay = min(delay * 2.0, max_delay)
 

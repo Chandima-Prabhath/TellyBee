@@ -35,10 +35,12 @@ async def cmd_start(message: Message, settings: Settings, user_role: str) -> Non
         "🐝 <b>TellyBee</b> — file downloader\n\n"
         "Send or forward me any file or media and I'll save it to the server:\n"
         "🖼 photos · 🎬 videos · 📄 documents · 🎵 audio · 🎙 voice\n"
-        "🎞 GIFs · 🏷 stickers · albums & media groups\n\n"
+        "🎞 GIFs · 🏷 stickers · albums & media groups\n"
+        "🌐 Or send a direct http(s) link — no size limit, multi-connection\n\n"
         f"Your access: <b>{who}</b>\n\n"
         "🤖 <b>Commands</b>\n"
         "/help — usage guide\n"
+        "/link &lt;url&gt; — download from a direct link\n"
         "/status — your recent downloads\n"
         "/queue — live download monitor\n"
         "/cancel &lt;id&gt; — cancel a download\n"
@@ -70,8 +72,10 @@ async def cmd_help(message: Message, settings: Settings) -> None:
     text = (
         "📖 <b>How to use TellyBee</b>\n\n"
         "1. Send or forward files, photos, videos, voice notes…\n"
-        "2. Watch live progress for large transfers.\n"
-        "3. Get a receipt with size, speed and location when done.\n\n"
+        "2. Or send a direct http(s) link / use /link — downloaded straight\n"
+        "   from the source server, no Telegram size limits.\n"
+        "3. Watch live progress for large transfers.\n"
+        "4. Get a receipt with size, speed and location when done.\n\n"
         "🗂 <b>Storage</b>\n"
         f"Files land in <code>{escape(settings.file_template)}</code> "
         f"under the downloads root.\n\n"
@@ -79,8 +83,14 @@ async def cmd_help(message: Message, settings: Settings) -> None:
         f"• Max file size: {human_size(settings.max_file_size)}\n"
         f"• Parallel downloads: {settings.download_concurrency}\n"
         f"• Queue capacity: {settings.max_queue_size}\n"
-        f"• Accepted: {filters}\n\n"
-        "💡 Forward a whole album — it is saved as one batch with a single "
+        f"• Accepted: {filters}\n"
+        + (
+            f"• Link downloads: on — {settings.link_connections} connections "
+            f"per file\n"
+            if settings.links_enabled
+            else "• Link downloads: off\n"
+        )
+        + "\n💡 Forward a whole album — it is saved as one batch with a single "
         "summary receipt."
     )
     await message.answer(text)
@@ -147,6 +157,17 @@ def _render_queue(snapshot) -> str:
 
 def _job_line(job: DownloadJob) -> str:
     name = escape(job.file_name or job.rel_path)
+    if job.waiting_since is not None and job.fetch_total:
+        # Server-side fetch phase (local Bot API mode): show the watcher's
+        # real progress instead of a misleading 0% transfer bar.
+        frac = job.fetch_fraction
+        return (
+            f"<code>#{job.job_id}</code> {type_icon(job.media_type)} {name}\n"
+            f"   📡 fetching {human_size(job.fetch_done or 0)}/"
+            f"{human_size(job.fetch_total)} "
+            f"<code>{progress_bar(frac)} {pct(frac)}</code> "
+            f"• {human_speed(job.fetch_speed)}"
+        )
     bar = progress_bar(job.progress_fraction)
     line = (
         f"<code>#{job.job_id}</code> {type_icon(job.media_type)} {name}\n"

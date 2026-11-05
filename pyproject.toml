@@ -3,7 +3,7 @@ name = "tellybee"
 version = "0.1.0"
 description = "TellyBee — a modern, fast and stable Telegram file/media downloader bot"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Chandima Prabhath" }]
 keywords = ["telegram", "bot", "downloader", "aiogram", "asyncio"]
@@ -29,7 +29,7 @@ addopts = "-q"
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [

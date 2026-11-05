@@ -33,6 +33,7 @@ CLOUD_API_BASE = "https://api.telegram.org"
 _USER_COMMANDS = [
     BotCommand(command="start", description="Welcome & capabilities"),
     BotCommand(command="help", description="Usage guide and limits"),
+    BotCommand(command="link", description="Download a direct http(s) link"),
     BotCommand(command="status", description="Your recent downloads"),
     BotCommand(command="queue", description="Live download monitor"),
     BotCommand(command="cancel", description="Cancel a download by id"),
@@ -50,7 +51,7 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
 ]
 
 
-async def cloud_logout(token: str, *, base: str = CLOUD_API_BASE, timeout: float = 20.0) -> bool:
+async def cloud_logout(token: str, *, base: str = CLOUD_API_BASE, timeout: float = 20.0) -> bool:  # noqa: ASYNC109 — public kwarg, kept for API stability
     """Log the bot out of the cloud Bot API — required before a local server serves it.
 
     Telegram's handshake rule for local Bot API servers: the bot must call

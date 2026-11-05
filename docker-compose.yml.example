@@ -69,6 +69,16 @@ services:
   botapi:
     # arm64 + amd64 images (see hub.docker.com/r/aiogram/telegram-bot-api)
     image: aiogram/telegram-bot-api:10.3
+    # OPTIONAL — faster big-file downloads: build a patched server that sets
+    # the TDLib "session_count" option (raises TDLib's per-file in-flight
+    # download window 8×). First build compiles TDLib — hours on ARM, then
+    # cached. Comment out `image:` above and uncomment this block. See the
+    # "Speeding up big-file downloads" section in the README first.
+    # build:
+    #   context: ./deploy/botapi-fast
+    #   args:
+    #     TELEGRAM_BOT_API_REF: master
+    #     SESSION_COUNT: "4"
     container_name: tellybee-botapi
     restart: unless-stopped
     # ── Why the custom entrypoint? ───────────────────────────────────────

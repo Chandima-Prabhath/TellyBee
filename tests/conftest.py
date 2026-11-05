@@ -30,7 +30,7 @@ def make_message(photo: bool = True, caption: str | None = None):
 
     return Message(
         message_id=42,
-        date=datetime.datetime.now(datetime.timezone.utc),
+        date=datetime.datetime.now(datetime.UTC),
         chat=Chat(id=100, type="private"),
         photo=(
             [PhotoSize(file_id="file-1", file_unique_id="uniq-1", width=800, height=600, file_size=123456)]

@@ -37,6 +37,7 @@ _TYPE_ICONS = {
     "video_note": "⭕️",
     "sticker": "🏷",
     "animation": "🎞",
+    "url": "🌐",
 }
 
 
@@ -87,6 +88,16 @@ class _Group:
     @property
     def any_running(self) -> bool:
         return any(j.status is JobStatus.RUNNING for j in self.jobs.values())
+
+    @property
+    def any_waiting(self) -> bool:
+        """Any job parked in getFile while the local server fetches it.
+
+        With prefetching this happens while the job is still QUEUED — the
+        message must exist and keep updating even before a worker starts it,
+        otherwise a queue of big files shows nothing at all.
+        """
+        return any(j.waiting_since is not None for j in self.jobs.values())
 
     def eta(self) -> float | None:
         speed = self.speed
@@ -150,17 +161,18 @@ class Notifier:
             while True:
                 await asyncio.sleep(0.4)
                 # Lazily create the message once transfer actually started
-                # and the group is big enough to be worth it.
+                # (or the server-side fetch — with prefetch a QUEUED job is
+                # already fetching) and the group is big enough to be worth it.
                 if (
                     group.message_id is None
                     and not group.broken
-                    and group.any_running
+                    and (group.any_running or group.any_waiting)
                     and group.expected_bytes >= self._settings.progress_min_bytes
                 ):
                     async with group.lock:
                         if group.message_id is None and group.jobs:
                             await self._send_progress_message(group)
-                if group.message_id is not None and group.any_running:
+                if group.message_id is not None and (group.any_running or group.any_waiting):
                     await self._edit_throttled(group)
         except asyncio.CancelledError:
             return
@@ -199,7 +211,9 @@ class Notifier:
                 return
             logger.debug("edit failed for group %s: %s", group.key, err)
         except TelegramRetryAfter as err:
-            await asyncio.sleep(err.retry_after or 1)
+            # Back off hard: pushing the throttle window past the flood wait
+            # keeps later edits quiet instead of hammering into 429 again.
+            group._last_edit = time.monotonic() + (err.retry_after or 1)
         except Exception as err:  # noqa: BLE001
             logger.warning("cannot edit progress message in chat %s: %s", group.chat_id, err)
             group.broken = True
@@ -220,6 +234,7 @@ class Notifier:
     def _progress_text(self, group: _Group) -> str:
         running = [j for j in group.jobs.values() if j.status is JobStatus.RUNNING]
         queued = [j for j in group.jobs.values() if j.status is JobStatus.QUEUED]
+        waiting = [j for j in group.jobs.values() if j.waiting_since is not None]
         count = len(group.jobs) + len(group.results)
         lines: list[str] = []
 
@@ -231,30 +246,55 @@ class Notifier:
             name = job.file_name or job.rel_path if job else "file"
             lines.append(f"⬇️ <b>Downloading</b> {escape(name)}")
 
-        fraction = group.fraction
-        if fraction is not None:
-            lines.append(
-                f"<code>{progress_bar(fraction)} {pct(fraction)}</code>"
-            )
-        lines.append(
-            f"{human_size(group.bytes_done)} / {human_size(group.expected_bytes)}"
-            f" • {human_speed(group.speed)}"
-        )
-        eta = group.eta()
-        if eta is not None and fraction is not None and fraction < 1:
-            lines[-1] += f" • ETA {fmt_eta(eta)}"
-
-        # Server-side fetch phase (local Bot API mode): the engine is parked
-        # in getFile while Telegram streams the file to the local server —
-        # nothing to show but a growing elapsed counter instead of a frozen
-        # 0% bar that looks like a hang.
-        waiting = [j for j in group.jobs.values() if j.waiting_since is not None]
+        # Phase 1 — the local Bot API server fetching the file from Telegram
+        # (the getFile wait). The engine's volume watcher fills fetch_done /
+        # fetch_speed, so this is real progress; without it (or in cloud mode)
+        # fall back to a growing elapsed counter instead of a frozen 0% bar
+        # that looks like a hang.
         if waiting:
-            elapsed = max(time.monotonic() - j.waiting_since for j in waiting)
+            fetch_total = sum(j.fetch_total or j.file_size or 0 for j in waiting)
+            fetch_done = sum(j.fetch_done or 0 for j in waiting)
+            speed = sum(j.fetch_speed for j in waiting)
+            if fetch_total and fetch_done:
+                frac = min(1.0, fetch_done / fetch_total)
+                lines.append(
+                    f"📡 <b>Fetching from Telegram</b>"
+                    f"{' — ' + plural_files(len(waiting)) if len(waiting) > 1 else ''}"
+                )
+                lines.append(f"<code>{progress_bar(frac)} {pct(frac)}</code>")
+                detail = (
+                    f"{human_size(fetch_done)} / {human_size(fetch_total)} "
+                    f"• {human_speed(speed)}"
+                )
+                if speed > 0 and frac < 1.0:
+                    detail += f" • ETA {fmt_eta((fetch_total - fetch_done) / speed)}"
+                lines.append(detail)
+            else:
+                elapsed = max(time.monotonic() - j.waiting_since for j in waiting)  # type: ignore[arg-type]
+                lines.append(
+                    f"⏳ Telegram is preparing {plural_files(len(waiting))} — "
+                    f"{fmt_eta(elapsed)} so far (first-time big downloads take a while)"
+                )
+
+        # Phase 2 — the local copy into the downloads folder (fast). Only
+        # rendered once it actually runs, so the visible bar never "resets"
+        # from 100% fetch to 0% copy: the fetch block simply disappears and
+        # the copy block takes over.
+        transferring = group.bytes_done > 0 or any(
+            j.status is JobStatus.RUNNING and j.waiting_since is None
+            for j in group.jobs.values()
+        )
+        fraction = group.fraction
+        if transferring:
+            if fraction is not None:
+                lines.append(f"<code>{progress_bar(fraction)} {pct(fraction)}</code>")
             lines.append(
-                f"⏳ Telegram is preparing {plural_files(len(waiting))} — "
-                f"{fmt_eta(elapsed)} so far (first-time big downloads take a while)"
+                f"{human_size(group.bytes_done)} / {human_size(group.expected_bytes)}"
+                f" • {human_speed(group.speed)}"
             )
+            eta = group.eta()
+            if eta is not None and fraction is not None and fraction < 1:
+                lines[-1] += f" • ETA {fmt_eta(eta)}"
 
         if running and count == 1:
             pass  # header already carries the file name
@@ -264,8 +304,9 @@ class Notifier:
                     f"  {type_icon(job.media_type)} {escape(job.file_name or job.rel_path)} "
                     f"— {pct(job.progress_fraction)}"
                 )
-        if queued:
-            lines.append(f"⏳ {plural_files(len(queued))} waiting in queue")
+        queued_left = [j for j in queued if j.waiting_since is None]
+        if queued_left:
+            lines.append(f"⏳ {plural_files(len(queued_left))} waiting in queue")
         return "\n".join(lines)
 
     def _receipt_text(self, group: _Group) -> str:

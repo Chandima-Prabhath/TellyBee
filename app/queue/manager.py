@@ -73,6 +73,8 @@ class DownloadManager:
         self._settings = settings
         self._notifier = notifier
         self._engine = engine or DownloadEngine(bot, settings)
+        # job_id → prefetch task (server-side fetch-ahead, local mode only)
+        self._prefetch_tasks: dict[str, asyncio.Task] = {}
 
         self._queue: asyncio.PriorityQueue[tuple[int, int, DownloadJob]] = asyncio.PriorityQueue()
         self._seq = itertools.count()
@@ -100,7 +102,7 @@ class DownloadManager:
         ]
         logger.info("download manager started with %d workers", len(self._workers))
 
-    async def shutdown(self, timeout: float = 25.0) -> None:
+    async def shutdown(self, timeout: float = 25.0) -> None:  # noqa: ASYNC109 — public kwarg, kept for API stability
         """Graceful drain: finish running jobs, cancel queued ones."""
         if self._stopping:
             return
@@ -108,6 +110,17 @@ class DownloadManager:
         self.resume()  # unblock parked workers so they can see sentinels
         logger.info("draining download queue (active=%d, pending=%d)…",
                     len(self._active), len(self._pending))
+
+        # Stop fetch-ahead first — no point warming the server's cache while
+        # shutting down. Workers waiting on a shared getFile keep waiting;
+        # engine.aclose() (below) cancels those once the workers are done.
+        if self._prefetch_tasks:
+            for task in list(self._prefetch_tasks.values()):
+                task.cancel()
+            await asyncio.gather(
+                *self._prefetch_tasks.values(), return_exceptions=True
+            )
+            self._prefetch_tasks.clear()
 
         # Cancel everything still queued so the DB reflects reality.
         await self._drain_pending()
@@ -121,7 +134,7 @@ class DownloadManager:
             await asyncio.wait_for(
                 asyncio.gather(*self._workers, return_exceptions=True), timeout=timeout
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("workers did not finish within %.0fs; forcing cancel", timeout)
             for job in list(self._active.values()):
                 job.cancel_event.set()
@@ -170,6 +183,31 @@ class DownloadManager:
                     job.job_id, job.media_type, job.rel_path, job.user.id)
         if self._notifier:
             self._notifier.attach(job)
+        self._schedule_prefetch(job)
+
+    def _schedule_prefetch(self, job: DownloadJob) -> None:
+        """Ask the engine to start the server-side fetch for a queued file.
+
+        Local Bot API mode only (the engine no-ops otherwise): the slow part
+        is the server downloading from Telegram, which normally only starts
+        when a worker picks the job — prefetching keeps the server busy
+        while workers copy already-finished files. The task races the job's
+        cancel event, so ``/cancel`` on a queued job aborts its prefetch too.
+        """
+        if not self._settings.prefetch:
+            return
+        prefetch = getattr(self._engine, "prefetch", None)
+        if prefetch is None:
+            return
+        task = asyncio.create_task(
+            prefetch(job), name=f"tellybee-prefetch-{job.job_id}"
+        )
+        self._prefetch_tasks[job.job_id] = task
+
+        def _done(_task: asyncio.Task, jid: str = job.job_id) -> None:
+            self._prefetch_tasks.pop(jid, None)
+
+        task.add_done_callback(_done)
 
     # ── worker loop ─────────────────────────────────────────────────────────
 
@@ -251,12 +289,20 @@ class DownloadManager:
         job = self._pending.get(job_id)
         if job:
             self._cancel_flags.add(job_id)
+            # Also trip the cancel event so a prefetch task fetching this
+            # queued file server-side aborts within a poll tick.
+            job.cancel_event.set()
             return "pending"
         job = self._active.get(job_id)
         if job:
             job.cancel_event.set()  # engine aborts at the next chunk boundary
             return "running"
         return None
+
+    @property
+    def engine(self):
+        """The download engine (used by handlers to probe direct links)."""
+        return self._engine
 
     def find_job(
         self, job_id: str, user_id: int | None = None, admin: bool = False

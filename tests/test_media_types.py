@@ -10,7 +10,7 @@ from app.services.media_types import extract_media
 def _msg(**kwargs) -> Message:
     base = dict(
         message_id=1,
-        date=datetime.datetime.now(datetime.timezone.utc),
+        date=datetime.datetime.now(datetime.UTC),
         chat=Chat(id=1, type="private"),
     )
     base.update(kwargs)

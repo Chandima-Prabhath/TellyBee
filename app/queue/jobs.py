@@ -70,6 +70,17 @@ class DownloadJob:
     #: server-side download). The notifier shows a "preparing" phase instead
     #: of a frozen 0% progress bar during that window. Monotonic timestamp.
     waiting_since: float | None = None
+    #: Live progress of the SERVER-SIDE fetch (local Bot API mode), filled by
+    #: the engine's volume watcher: it watches the server's cache directory
+    #: while getFile is parked and maps growing files to waiting jobs by their
+    #: expected size. Kept separate from the transfer counters so receipts,
+    #: totals and average speeds stay honest.
+    fetch_done: int | None = None
+    fetch_total: int | None = None
+    fetch_speed: float = 0.0
+    #: Watcher-internal sticky candidate path (inside the server's storage,
+    #: contains the bot token — NEVER log or send it anywhere).
+    fetch_path: str | None = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     # ── progress helpers ────────────────────────────────────────────────────
@@ -94,6 +105,19 @@ class DownloadJob:
             return 0.0
         end = self.finished_at or time.monotonic()
         return max(0.0, end - self.started_at)
+
+    @property
+    def fetch_fraction(self) -> float | None:
+        """Progress of the server-side fetch (local Bot API mode), 0..1."""
+        if not self.fetch_total or self.fetch_done is None:
+            return None
+        return min(1.0, self.fetch_done / self.fetch_total)
+
+    @property
+    def fetch_eta_seconds(self) -> float | None:
+        if not self.fetch_total or self.fetch_done is None or self.fetch_speed <= 0:
+            return None
+        return max(0.0, (self.fetch_total - self.fetch_done) / self.fetch_speed)
 
     def is_cancelled(self) -> bool:
         return self.cancel_event.is_set()

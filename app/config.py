@@ -157,6 +157,26 @@ class Settings(BaseSettings):
     # Telegram file links are reusable ~1h; cache getFile lookups this long.
     file_cache_ttl: float = 900.0
 
+    # ── Server-side fetch-ahead (local Bot API mode) ────────────────────
+    # Start fetching queued files on the local Bot API server immediately
+    # instead of waiting for a worker slot — the server-side download is the
+    # slow part of local mode, so keeping it busy pipelines the queue.
+    prefetch: bool = True
+    # How many files may be fetched server-side at once (0 disables).
+    prefetch_slots: int = 6
+    # How often (seconds) the engine polls the server's shared volume to
+    # estimate live fetch progress for waiting jobs.
+    fetch_watch_interval: float = 1.5
+
+    # ── Direct link downloads (/link + URLs in messages) ─────────────────
+    links_enabled: bool = True
+    # Parallel range connections per link (servers without range support
+    # fall back to a single stream automatically).
+    link_connections: int = 4
+    # Per-link size cap; 0 = uncapped (the queue's disk-headroom guard and
+    # ENOSPC handling still apply). Accepts human sizes, e.g. 10GB.
+    link_max_size: int = 0
+
     # ── Progress UX ─────────────────────────────────────────────────────────
     # Only files (or albums) at least this big get a live progress message.
     progress_min_bytes: int = 2 * 1024 * 1024
@@ -207,6 +227,14 @@ class Settings(BaseSettings):
     )
     @classmethod
     def _parse_bytes(cls, raw: object) -> int:
+        return parse_size(raw)
+
+    @field_validator("link_max_size", mode="before")
+    @classmethod
+    def _parse_link_cap(cls, raw: object) -> int:
+        """Empty LINK_MAX_SIZE= means "uncapped" (0), like other .env blanks."""
+        if isinstance(raw, str) and not raw.strip():
+            return 0
         return parse_size(raw)
 
     @field_validator("bot_token", mode="before")
@@ -274,6 +302,16 @@ class Settings(BaseSettings):
                 "Bot API server can legitimately take minutes to answer getFile "
                 "while it fetches a large file)"
             )
+        if not 0 <= self.prefetch_slots <= 32:
+            raise ValueError("PREFETCH_SLOTS must be between 0 and 32")
+        if not 0.2 <= self.fetch_watch_interval <= 30.0:
+            raise ValueError(
+                "FETCH_WATCH_INTERVAL must be between 0.2 and 30 seconds"
+            )
+        if not 1 <= self.link_connections <= 16:
+            raise ValueError("LINK_CONNECTIONS must be between 1 and 16")
+        if self.link_max_size < 0:
+            raise ValueError("LINK_MAX_SIZE cannot be negative (0 = uncapped)")
         if self.chunk_size < 8 * 1024:
             raise ValueError("CHUNK_SIZE must be at least 8KB")
         # Download caps depend on the transport: a local Bot API server
@@ -337,5 +375,7 @@ class Settings(BaseSettings):
             f"mode={mode} token={token} downloads={self.download_dir} "
             f"db={self.db_path} workers={self.download_concurrency} "
             f"admins={len(self.admin_ids)} allowed={len(self.allowed_user_ids)} "
-            f"open_access={self.open_access}"
+            f"open_access={self.open_access} "
+            f"prefetch={self.prefetch and self.prefetch_slots > 0} "
+            f"links={self.links_enabled}"
         )
