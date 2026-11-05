@@ -99,9 +99,7 @@ def build_relative_dir(template: str, tokens: dict[str, str]) -> Path:
     """Render the template into a sanitized relative directory path."""
     rendered = template.format(**tokens)
     segments = [
-        sanitize_segment(part, fallback="_")
-        for part in rendered.split("/")
-        if part.strip()
+        sanitize_segment(part, fallback="_") for part in rendered.split("/") if part.strip()
     ]
     # Defense in depth: drop anything weird that survived sanitization.
     segments = [s for s in segments if s not in {".", "..", ""}]
@@ -133,13 +131,29 @@ def resolve_destination(
     media: MediaInfo,
     chat: ChatInfo,
     when: datetime | None = None,
+    *,
+    single_folder: bool = False,
+    folder_name: str | None = None,
 ) -> tuple[Path, str]:
     """Compute the final absolute destination for a media file.
 
     Returns ``(absolute_path, relative_display_path)``.
+
+    By default the relative directory is rendered from ``template``. When
+    ``single_folder`` is set (the user's /folder preference), everything the
+    user saves lands in ONE folder instead — ``{user}``, or
+    ``{user}/{folder_name}`` when a name was given (e.g. a series title),
+    so a TV-season batch forwarded over several days stays together
+    instead of being scattered across per-date folders.
     """
-    tokens = build_template_tokens(user, media, chat, when)
-    rel_dir = build_relative_dir(template, tokens)
+    if single_folder:
+        segments = [user.safe_name]
+        if folder_name and folder_name.strip():
+            segments.append(sanitize_segment(folder_name, fallback="folder"))
+        rel_dir = Path(*segments)
+    else:
+        tokens = build_template_tokens(user, media, chat, when)
+        rel_dir = build_relative_dir(template, tokens)
     ext = media.suggested_extension()
     original = media.file_name or f"{media.kind}_{media.file_unique_id}{ext}"
     filename = sanitize_filename(original, fallback=f"{media.kind}_{media.file_unique_id}{ext}")

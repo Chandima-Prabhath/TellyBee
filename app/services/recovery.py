@@ -73,31 +73,40 @@ def _sweep_parts_sync(root: Path) -> tuple[int, int]:
 def interrupted_report(rows: list[dict]) -> str:
     """The chat-facing summary of what a reboot killed."""
     count = len(rows)
-    lines = [
-        f"🔁 <b>Rebooted mid-job</b> — {count} download"
+    header = (
+        f"🔁 <b>Rebooted mid-job</b> · {count} download"
         f"{'s' if count != 1 else ''} "
-        f"{'were' if count != 1 else 'was'} interrupted:"
-    ]
+        f"{'were' if count != 1 else 'was'} interrupted"
+    )
+    body = []
     for row in rows[:_MAX_LISTED]:
         name = escape(row.get("file_name") or row.get("media_type") or "file")
         size = human_size(row["file_size"]) if row.get("file_size") else ""
-        suffix = f" — {size}" if size else ""
-        lines.append(f"• {name}{suffix}")
+        suffix = f" · {size}" if size else ""
+        body.append(f"{name}{suffix}")
     hidden = len(rows) - _MAX_LISTED
     if hidden > 0:
-        lines.append(f"… and {hidden} more")
-    lines.append("\nRe-send them, or press the button — the queue picks up where it can.")
-    return "\n".join(lines)
+        body.append(f"… and {hidden} more")
+    quote = "\n".join(body)
+    divider = "─" * 22
+    return (
+        f"{header}\n"
+        f"{divider}\n"
+        f"<blockquote>{quote}</blockquote>\n"
+        "Re-send them, or press the button — the queue picks up where it can."
+    )
 
 
 def requeue_keyboard(count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"🔁 Re-queue {count} file{'s' if count != 1 else ''}",
-                callback_data="tb:req",
-            )
-        ]]
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"🔁 Re-queue {count} file{'s' if count != 1 else ''}",
+                    callback_data="tb:req",
+                )
+            ]
+        ]
     )
 
 
@@ -114,7 +123,8 @@ async def recover_after_reboot(bot: Bot, settings: Settings, db: Database) -> No
     if removed:
         logger.info(
             "reboot recovery: removed %d orphaned .part file(s), %s freed",
-            removed, human_size(freed),
+            removed,
+            human_size(freed),
         )
     if not stale:
         return
@@ -140,6 +150,4 @@ async def recover_after_reboot(bot: Bot, settings: Settings, db: Database) -> No
                 reply_markup=requeue_keyboard(len(rows)),
             )
         except Exception as err:  # noqa: BLE001 — chat may be gone
-            logger.warning(
-                "could not deliver the reboot report to chat %s: %s", chat_id, err
-            )
+            logger.warning("could not deliver the reboot report to chat %s: %s", chat_id, err)

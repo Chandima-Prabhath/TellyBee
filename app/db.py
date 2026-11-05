@@ -65,6 +65,16 @@ CREATE TABLE IF NOT EXISTS progress_windows (
     chat_id    INTEGER PRIMARY KEY,
     message_id INTEGER NOT NULL
 );
+
+-- Per-user download destination preference (the /folder command):
+-- 'default' = FILE_TEMPLATE folders, 'single' = everything in one
+-- folder (optionally a named one — great for TV series batches).
+CREATE TABLE IF NOT EXISTS user_prefs (
+    user_id     INTEGER PRIMARY KEY,
+    folder_mode TEXT NOT NULL DEFAULT 'default'
+                CHECK (folder_mode IN ('default', 'single')),
+    folder_name TEXT
+);
 """
 
 # Role cache lives here so /allow & /disallow can invalidate it centrally.
@@ -252,8 +262,15 @@ class Database:
         await self.conn.commit()
 
     async def update_download(
-        self, job_id: str, status: str, *, error: str | None = None, sha256: str | None = None,
-        avg_speed: float | None = None, duration_ms: int | None = None, finished: bool = False,
+        self,
+        job_id: str,
+        status: str,
+        *,
+        error: str | None = None,
+        sha256: str | None = None,
+        avg_speed: float | None = None,
+        duration_ms: int | None = None,
+        finished: bool = False,
     ) -> None:
         await self.conn.execute(
             """
@@ -352,16 +369,12 @@ class Database:
         await self.conn.commit()
 
     async def drop_window(self, chat_id: int) -> None:
-        await self.conn.execute(
-            "DELETE FROM progress_windows WHERE chat_id = ?", (chat_id,)
-        )
+        await self.conn.execute("DELETE FROM progress_windows WHERE chat_id = ?", (chat_id,))
         await self.conn.commit()
 
     async def list_windows(self) -> list[tuple[int, int]]:
         """(chat_id, message_id) of every window still on record."""
-        async with self.conn.execute(
-            "SELECT chat_id, message_id FROM progress_windows"
-        ) as cursor:
+        async with self.conn.execute("SELECT chat_id, message_id FROM progress_windows") as cursor:
             return [(row["chat_id"], row["message_id"]) for row in await cursor.fetchall()]
 
     async def user_history(self, user_id: int, limit: int = 10) -> list[dict]:
@@ -374,6 +387,38 @@ class Database:
             (user_id, limit),
         ) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
+
+    # ── user preferences (/folder) ──────────────────────────────────────────
+
+    async def get_folder_pref(self, user_id: int) -> tuple[str, str | None]:
+        """(folder_mode, folder_name) for a user; ('default', None) if unset."""
+        async with self.conn.execute(
+            "SELECT folder_mode, folder_name FROM user_prefs WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return ("default", None)
+        return (row["folder_mode"], row["folder_name"])
+
+    async def set_folder_pref(self, user_id: int, mode: str, name: str | None = None) -> None:
+        """Store the user's download-destination preference.
+
+        ``mode`` is 'default' (FILE_TEMPLATE) or 'single' (one folder);
+        ``name`` is an optional sub-folder for single mode (NULL clears it).
+        """
+        if mode not in ("default", "single"):
+            raise ValueError(f"invalid folder mode: {mode!r}")
+        await self.conn.execute(
+            """
+            INSERT INTO user_prefs (user_id, folder_mode, folder_name) VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                folder_mode = excluded.folder_mode,
+                folder_name = excluded.folder_name
+            """,
+            (user_id, mode, name),
+        )
+        await self.conn.commit()
 
     async def global_stats(self) -> dict:
         stats: dict = {}

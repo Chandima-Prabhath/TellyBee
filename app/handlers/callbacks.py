@@ -1,18 +1,17 @@
-"""Inline-keyboard actions — the window's remote control (0.4.1).
+"""Inline-keyboard actions — the window's remote control (0.5).
 
 The unified progress window carries a button row on every frame, so the
 common actions no longer need typed commands:
 
 ``⏸ Pause / ▶️ Resume``  queue toggle (admin, like /pause /resume)
-``📋 Queue``             live queue view (same scoping as /queue)
-``📊 Stats``             all-time statistics (admin, like /stats)
-``✖️ Cancel``            cancel THIS chat's downloads (own jobs for users)
-``❓ Help``              the usage guide
+``✖ Cancel all``        cancel THIS chat's downloads (own jobs for users)
+``📋 Queue``            live queue view (same scoping as /queue)
+``📊 Stats``            all-time statistics (admin, like /stats)
+``❓ Help``             the usage guide
 
-The reboot report (see app/services/recovery.py) adds one more button,
-``🔁 Re-queue``, which restores the interrupted jobs straight from the
-ledger's stored ``file_id``/``file_unique_id``/path — no re-forwarding
-needed.
+The /folder picker carries its own two buttons (One folder /
+Default folders) under the same ``tb:`` prefix, and the reboot report
+(see app/services/recovery.py) adds ``🔁 Re-queue``.
 
 Every handler ALWAYS answers the callback query (an unanswered button
 just spins in the client), and permission tiers mirror the command
@@ -31,9 +30,10 @@ from aiogram.types import CallbackQuery
 from app.config import Settings
 from app.db import Database
 from app.handlers.admin import stats_text
-from app.handlers.common import _render_queue, help_text
+from app.handlers.common import _render_queue, folder_keyboard, folder_text, help_text
 from app.queue.manager import DownloadManager, QueueFullError, build_job
 from app.services.filenaming import UserRef
+from app.utils.formatting import plural_files
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,8 @@ async def _answer(callback: CallbackQuery, text: str, *, alert: bool = False) ->
         logger.debug("callback answer failed: %s", text)
 
 
-async def _send(callback: CallbackQuery, text: str) -> None:
+async def _send(callback: CallbackQuery, text: str, notifier=None) -> None:
+    """Send a button reply, then keep the live window anchored at the bottom."""
     chat_id = _chat_id(callback)
     if chat_id is None:
         await _answer(callback, "Cannot answer here — ask me in our chat.")
@@ -81,6 +82,11 @@ async def _send(callback: CallbackQuery, text: str) -> None:
     except Exception as err:  # noqa: BLE001
         logger.warning("could not deliver button reply to chat %s: %s", chat_id, err)
         await _answer(callback, "Could not send the answer — try again in a moment.")
+        return
+    # The reply just buried the chat's progress window; move it back down.
+    reanchor = getattr(notifier, "reanchor", None)
+    if reanchor is not None:
+        reanchor(chat_id)
 
 
 @router.callback_query(F.data.startswith("tb:"))
@@ -102,16 +108,18 @@ async def on_window_button(
         if action == "pause" or action == "resume":
             await _toggle_queue(callback, manager, notifier, role, action)
         elif action == "queue":
-            await _show_queue(callback, manager, user_id, role)
+            await _show_queue(callback, manager, user_id, role, notifier)
         elif action == "stats":
-            await _show_stats(callback, db, manager, settings, role)
+            await _show_stats(callback, db, manager, settings, role, notifier)
         elif action == "cancel":
             await _cancel_chat_jobs(callback, manager, user_id, role)
         elif action == "help":
             await _answer(callback, "📖 Sending the guide…")
-            await _send(callback, help_text(settings))
+            await _send(callback, help_text(settings), notifier)
         elif action == "req":
             await _requeue_interrupted(callback, settings, db, manager)
+        elif action.startswith("fld:"):
+            await _set_folder(callback, settings, db, action.removeprefix("fld:"))
         else:
             await _answer(callback, "Unknown button — the window may be from an older version.")
     except Exception:  # noqa: BLE001 — a button must never crash the worker
@@ -122,6 +130,42 @@ async def on_window_button(
 # ── individual actions ──────────────────────────────────────────────────────
 
 
+async def _set_folder(callback: CallbackQuery, settings: Settings, db: Database, mode: str) -> None:
+    """The /folder picker buttons: switch the user's destination layout."""
+    if mode not in ("s", "d"):
+        await _answer(callback, "Unknown button.")
+        return
+    user = callback.from_user
+    if mode == "s":
+        # Keep a previously chosen custom folder name, if any.
+        _, name = await db.get_folder_pref(user.id)
+        await db.set_folder_pref(user.id, "single", name)
+        await _answer(callback, "🗂 One folder — new downloads land together.")
+    else:
+        await db.set_folder_pref(user.id, "default", None)
+        await _answer(callback, "📂 Default folders — organized by type & date.")
+    # Refresh the picker card in place so the ✅ marker follows the choice.
+    chat_id = _chat_id(callback)
+    message_id = getattr(callback.message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return
+    fresh_mode, fresh_name = await db.get_folder_pref(user.id)
+    try:
+        await callback.bot.edit_message_text(
+            folder_text(
+                settings,
+                UserRef(user.id, user.username, user.first_name),
+                fresh_mode,
+                fresh_name,
+            ),
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=folder_keyboard(fresh_mode),
+        )
+    except Exception:  # noqa: BLE001 — cosmetic only
+        logger.debug("could not refresh the /folder card")
+
+
 async def _toggle_queue(
     callback: CallbackQuery, manager: DownloadManager, notifier, role: str, action: str
 ) -> None:
@@ -130,10 +174,10 @@ async def _toggle_queue(
         return
     if action == "pause":
         manager.pause()
-        await _answer(callback, "⏸ Queue paused — running downloads finish, nothing new starts.")
+        await _answer(callback, "⏸ Paused — running downloads finish, nothing new starts.")
     else:
         manager.resume()
-        await _answer(callback, "▶️ Queue resumed.")
+        await _answer(callback, "▶️ Resumed.")
     # The window's next refresh swaps the button label and the header's
     # paused marker; reset the edit throttle so it happens on the next tick.
     refresh = getattr(notifier, "request_refresh", None)
@@ -142,7 +186,7 @@ async def _toggle_queue(
 
 
 async def _show_queue(
-    callback: CallbackQuery, manager: DownloadManager, user_id: int, role: str
+    callback: CallbackQuery, manager: DownloadManager, user_id: int, role: str, notifier=None
 ) -> None:
     await _answer(callback, "📋 Sending the queue…")
     if role == "admin":
@@ -152,12 +196,16 @@ async def _show_queue(
 
         active, pending = manager.jobs_for_user(user_id)
         snapshot = QueueSnapshot(
-            active=active, pending=pending, paused=manager.paused,
-            workers_total=manager.snapshot().workers_total, workers_busy=len(active),
-            completed=manager.completed, failed=manager.failed,
+            active=active,
+            pending=pending,
+            paused=manager.paused,
+            workers_total=manager.snapshot().workers_total,
+            workers_busy=len(active),
+            completed=manager.completed,
+            failed=manager.failed,
             cancelled=manager.cancelled,
         )
-    await _send(callback, _render_queue(snapshot))
+    await _send(callback, _render_queue(snapshot), notifier)
 
 
 async def _show_stats(
@@ -166,12 +214,13 @@ async def _show_stats(
     manager: DownloadManager,
     settings: Settings,
     role: str,
+    notifier=None,
 ) -> None:
     if role != "admin":
         await _answer(callback, "👑 Admins only.")
         return
     await _answer(callback, "📊 Sending the stats…")
-    await _send(callback, await stats_text(db, manager, settings))
+    await _send(callback, await stats_text(db, manager, settings), notifier)
 
 
 async def _cancel_chat_jobs(
@@ -192,8 +241,7 @@ async def _cancel_chat_jobs(
         return
     for job_id in targets:
         manager.cancel(job_id)
-    plural = "download" if len(targets) == 1 else "downloads"
-    await _answer(callback, f"🛑 Cancelling {len(targets)} {plural}…")
+    await _answer(callback, f"🛑 Cancelling {plural_files(len(targets))}…")
 
 
 async def _requeue_interrupted(
@@ -235,11 +283,9 @@ async def _requeue_interrupted(
 
     summary: list[str] = []
     if requeued:
-        plural = "file" if len(requeued) == 1 else "files"
-        summary.append(f"🔁 Re-queued {len(requeued)} {plural} — progress in the window below.")
+        summary.append(f"🔁 Re-queued {plural_files(len(requeued))} — watch the window.")
     if settled:
-        plural = "file" if len(settled) == 1 else "files"
-        summary.append(f"✅ {len(settled)} {plural} already saved or in the queue.")
+        summary.append(f"✅ {plural_files(len(settled))} already saved or in the queue.")
     if queue_full:
         summary.append("🚦 Queue is full — press the button again later for the rest.")
     if not requeued and not settled and not queue_full:
@@ -286,8 +332,6 @@ async def _replace_report(callback: CallbackQuery, text: str) -> None:
     if chat_id is None or message_id is None:
         return
     try:
-        await callback.bot.edit_message_text(
-            text, chat_id=chat_id, message_id=message_id
-        )
+        await callback.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
     except Exception:  # noqa: BLE001 — cosmetic only
         logger.debug("could not rewrite the reboot report message")

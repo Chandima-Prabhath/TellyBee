@@ -52,6 +52,7 @@ app/
 ├── config.py             ALL settings (pydantic-settings) + validators
 ├── bot_factory.py        Bot/Dispatcher construction, middleware order, command menu
 ├── db.py                 SQLite layer: users (ACL) + downloads (ledger)
+                         + progress_windows (crash cleanup) + user_prefs (/folder)
 ├── logging_setup.py      text/json logging
 ├── queue/
 │   ├── jobs.py           DownloadJob dataclass + JobStatus + progress math
@@ -62,16 +63,20 @@ app/
 │   ├── auth.py           admin/user tier resolution + denial replies
 │   └── album.py          media-group buffering → data["album"]
 ├── handlers/
-│   ├── common.py         /start /help /status /queue /cancel
+│   ├── common.py         /start /help /folder /status /queue /cancel
 │   ├── admin.py          /stats /users /allow /disallow /config /pause /resume /health
-│   └── media.py          media intake → jobs (type filters, size limits)
+│   ├── callbacks.py      every inline button (window remote control, /folder picker, Re-queue)
+│   ├── links.py          /link + URL auto-detect → jobs (probe, SSRF guard, caps)
+│   └── media.py          media intake → jobs (type filters, size limits, /folder-aware paths)
 ├── services/
 │   ├── media_types.py    Message → MediaInfo normalization + extension guessing
-│   ├── filenaming.py     template resolution, sanitization, collision handling
-│   └── notifier.py       progress messages, receipts, album grouping
+│   ├── filenaming.py     template resolution, sanitization, collision handling, /folder override
+│   └── notifier.py       the unified window (anchored), receipts, album grouping
 ├── web/health.py         /healthz /readyz + webhook mounting
 └── utils/                sizes (parse/format) and formatting (bars, escape)
-tests/                    pytest suite (mirrors the modules above)
+tests/                    focused pytest suite — pure logic + the two UX
+                          contracts (folder prefs, window anchoring) — see
+                          "Commands agents should run" for the philosophy
 ```
 
 ## Middleware & router order (DO NOT reorder casually)
@@ -123,16 +128,21 @@ workflow data is injected by parameter name — handlers declare
   and every fetch crawled at ~0 B/s). A prefetch whose fetch is still
   parked on the semaphore leaves `waiting_since` unset — no "preparing"
   message, no fetch progress — until its turn actually comes.
-- The notifier (0.4.0) gives each chat ONE live "window" message. Jobs are
+- The notifier (0.5) gives each chat ONE live "window" message. Jobs are
   tracked per chat in `_Window.live`; `attach()` kicks a debounced (re)creation
   (`_WINDOW_DEBOUNCE`, sliding ~0.9 s — a burst of forwards coalesces into ONE
   replacement), and `_recreate()` deletes the old message BEFORE sending the
-  fresh one, so the window always sits under the user's latest message. The
-  window's message lifecycle has a SINGLE writer: the per-window updater task
-  (`_updater`) — `attach`/`finish` only mutate `live`, session counters and
+  fresh one. **Bottom anchoring (v0.5): every delivered receipt and every
+  button reply calls `_reanchor(chat_id)`**, which re-kicks the debounced
+  recreate so the window is re-sent below the bot's latest message — the
+  window must stay the chat's NEWEST message while live work remains. When
+  `live` is empty `_reanchor` is a no-op: the last receipt is the correct
+  bottom message and the updater closes the window instead.
+  The window's message lifecycle has a SINGLE writer: the per-window updater task
+  (`_updater`) — `attach`/`finish`/`_reanchor` only mutate `live`, session counters and
   `kick_at` (plain atomic writes, no locks). When the chat's `live` drains,
   the updater deletes the window (`_close`) and pops the chat; receipts are
-  ALWAYS fresh sends now (`_send_receipt`, one bounded `Retry-After` retry)
+  ALWAYS fresh sends (`_send_receipt`, one bounded `Retry-After` retry)
   because the window is transient. Window message ids are persisted in the
   `progress_windows` table so `notifier.startup()` can delete orphans a crash
   left behind, and `aclose()` sweeps live windows on clean shutdown. Routine
@@ -140,12 +150,19 @@ workflow data is injected by parameter name — handlers declare
   plus the global pacer (one edit in flight, ~1/s across ALL chats — routine
   refreshes dropped, never queued). `PROGRESS_MIN_BYTES` is GONE — tiny files
   simply finish before the debounce fires and never produce a window.
-- Honest receipt speeds (v0.3.3): when a job's server-side fetch finished
-  before a worker picked it up (`fetched_ahead`, set by `prefetch()` on
-  success or by the `_attempt` cache-hit check), `_finish` reports
-  `job.fetch_bps` (fetch_total / waited, captured in `_end_fetch_wait`) as
-  `avg_speed` instead of the instant disk-copy rate, and the receipt says
-  "fetched ahead … copy was instant" — never a misleading "250 MB/s".
+- **User-facing text hides the machine room (v0.5).** The two transport
+  phases of local Bot API mode (server-side fetch vs local copy) are an
+  implementation detail: the window/queue render ONE bar + meta line for
+  both, receipts just show a speed. Never emit "prefetch", "Telegram
+  fetch", "fetched ahead", "copy was instant" or similar into chat text;
+  `tests/test_window_ux.py` asserts the jargon stays out.
+- Honest receipt speeds (v0.3.3, quiet since v0.5): when a job's server-side
+  fetch finished before a worker picked it up (`fetched_ahead`, set by
+  `prefetch()` on success or by the `_attempt` cache-hit check), `_finish`
+  reports `job.fetch_bps` (fetch_total / waited, captured in `_end_fetch_wait`)
+  as `avg_speed` instead of the instant disk-copy rate — the receipt shows
+  the number, never a misleading "250 MB/s", and never an explanation of
+  where it came from.
 
 ## Adding things (checklists)
 
@@ -166,9 +183,18 @@ with human-readable messages — never coerce silently.
 admin-gated), register in `_ADMIN_COMMANDS` in `bot_factory.py`, document
 in README's command table.
 
+**A new user command**: handler in `handlers/common.py` (the common router
+is registered first, so commands always beat the media catch-all), register
+in `_USER_COMMANDS` in `bot_factory.py`, document in README's command table.
+If it needs buttons, prefix callback data with `tb:` and dispatch it in
+`handlers/callbacks.py::on_window_button` — every branch MUST answer the
+callback query (see Gotchas).
+
 **A new table/column**: bump the schema in `db.py::_SCHEMA`
 (`CREATE TABLE IF NOT EXISTS` style — no migration framework on purpose;
 additive `ALTER TABLE` guards are acceptable for a new column).
+Existing tables get the new sibling automatically on `connect()` because
+the whole script is `IF NOT EXISTS` (that is how `user_prefs` shipped).
 
 ## Commands agents should run
 
@@ -179,14 +205,26 @@ uv run pytest                # MUST pass fully before any commit
 uv run python -m app.main --check   # validate config wiring without a token
 ```
 
-Testing philosophy: unit-test pure logic (naming, parsing, formatting,
-config validation, queue mechanics with `StubEngine` + `NullNotifier`).
-No test may touch the network or require a real bot token. aiogram type
-objects (Message, PhotoSize, …) are constructed directly as pydantic
-models — see `tests/test_media_types.py` for the pattern.
+Testing philosophy (trimmed in v0.5 from ~4800 lines of mock-heavy suites
+  to a focused core): keep fast, pure-logic tests (naming, parsing,
+  formatting, config validation, path safety, media extraction) plus slim
+  contract tests with plain fakes for the UX invariants users feel
+  (`tests/test_folder_prefs.py`, `tests/test_window_ux.py`). No test may
+  touch the network or require a real bot token; no deep-mocked bot
+  frameworks. aiogram type objects (Message, PhotoSize, …) are constructed
+  directly as pydantic models — see `tests/test_media_types.py` for the
+  pattern.
 
 ## Gotchas learned the hard way
 
+- **Chat text is Telegram's restricted HTML, not the web's.** Allowed tags:
+`<b> <i> <u> <s> <a> <code> <pre> <blockquote> <blockquote expandable>
+<tg-spoiler> <tg-emoji>`. There is **no `<br>`** — newlines are literal.
+File lists belong in `<blockquote>` blocks, long ones in
+`<blockquote expandable>` so Telegram collapses them; pair every opening
+tag with its closing `</…>` (unbalanced tags make Telegram reject the whole
+message). And every user-controlled string still goes through `escape()`
+before any of the tags wrap it.
 - **aiogram `Bot(token, session, default)`** — there is no `base=` kwarg;
   a custom Bot API server goes through
   `AiohttpSession(api=TelegramAPIServer.from_base(...))`.
@@ -388,7 +426,7 @@ models — see `tests/test_media_types.py` for the pattern.
 - **`db.get_role()` is backed by a process-wide `_role_cache` keyed by
   user id** — tests that create multiple databases must call
   `Database.invalidate_role_cache()` or roles leak across test databases
-  (first observed in test_callbacks.py).
+  (first observed while testing callbacks).
 - **Reboot recovery runs BEFORE polling starts** (`main.run()` calls
   `recover_after_reboot` right after `manager.start()`): stale
   queued/running rows → `interrupted`, `*.part` orphans swept (a `.part` at

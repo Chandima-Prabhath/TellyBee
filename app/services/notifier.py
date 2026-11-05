@@ -1,4 +1,4 @@
-"""In-chat progress & receipt UX — the unified window model (v0.4).
+"""In-chat progress & receipt UX — the unified window model (v0.5).
 
 Each chat gets at most ONE live "window" message: a single frame showing
 everything the queue is doing for that chat right now, updated in place —
@@ -8,8 +8,11 @@ Lifecycle:
 
 * A new task arrives → the previous window message is **deleted** and a
   fresh one is sent, debounced ~0.9 s so a burst of forwards (albums,
-  multi-select) collapses into a single replacement. The window therefore
-  always sits directly under the user's latest message.
+  multi-select) collapses into a single replacement.
+* The window is also **re-anchored** whenever the bot sends anything else
+  to the chat (a receipt): the frame is re-sent below it, so the live
+  window always stays the *latest* message in the chat instead of drifting
+  up with every finished file.
 * While work runs, the window is edited in place — one message per chat
   instead of one per job, so there is nothing to fight over the edit
   budget (the global pacer from 0.3.3 stays as a safety net).
@@ -19,9 +22,12 @@ Lifecycle:
   orphaned frames instead of leaving a frozen "47%" message in the chat
   forever.
 
-Receipts keep their 0.3.3 honesty rules (fetch vs copy speeds, prefetched
-files, one combined receipt per album) and are always sent as fresh
-messages — the window they used to be edited into is transient now.
+Receipts are always sent as fresh messages — the window is transient.
+
+User-facing wording (v0.5): progress is just progress. The internal
+fetch/copy split of local Bot API mode ("prefetch", "Telegram fetch") is
+an implementation detail — users see one download bar; receipts report
+the honest transfer speed without explaining where it came from.
 """
 
 from __future__ import annotations
@@ -58,6 +64,8 @@ _RECEIPT_MAX_WAIT = 15.0
 _WINDOW_FLOOD_PARK = 30.0
 #: How many active entries (job or collapsed album) get detailed lines.
 _MAX_ACTIVE_ENTRIES = 6
+#: Visual separator between a header and the body of a message.
+_DIVIDER = "\u2500" * 22
 
 #: Callback payload prefix shared by every window button (see handlers/callbacks.py).
 _CB = "tb:"
@@ -106,8 +114,18 @@ class _Window:
     one writer per message, no locks needed.
     """
 
-    __slots__ = ("chat_id", "message_id", "live", "done", "failed",
-                 "cancelled", "kick_at", "broken", "updater_task", "_last_edit")
+    __slots__ = (
+        "chat_id",
+        "message_id",
+        "live",
+        "done",
+        "failed",
+        "cancelled",
+        "kick_at",
+        "broken",
+        "updater_task",
+        "_last_edit",
+    )
 
     def __init__(self, chat_id: int):
         self.chat_id = chat_id
@@ -158,7 +176,8 @@ class Notifier:
         within one updater tick instead of after the full edit interval.
         """
         windows = (
-            [self._windows[chat_id]] if chat_id is not None and chat_id in self._windows
+            [self._windows[chat_id]]
+            if chat_id is not None and chat_id in self._windows
             else list(self._windows.values())
         )
         for window in windows:
@@ -308,14 +327,10 @@ class Notifier:
         except TelegramRetryAfter as err:
             # No sleeping the updater away: park the next attempt beyond
             # the announced window (bounded) and try again then.
-            window.kick_at = time.monotonic() + min(
-                float(err.retry_after or 1), _WINDOW_FLOOD_PARK
-            )
+            window.kick_at = time.monotonic() + min(float(err.retry_after or 1), _WINDOW_FLOOD_PARK)
             return
         except Exception as err:  # noqa: BLE001 — chat may be unreachable
-            logger.warning(
-                "cannot send progress window to chat %s: %s", window.chat_id, err
-            )
+            logger.warning("cannot send progress window to chat %s: %s", window.chat_id, err)
             window.broken = True
             return
         window.message_id = message.message_id
@@ -360,9 +375,7 @@ class Notifier:
                 # flood wait so later ticks stay quiet.
                 window._last_edit = time.monotonic() + (err.retry_after or 1)
             except Exception as err:  # noqa: BLE001
-                logger.warning(
-                    "cannot edit progress window in chat %s: %s", window.chat_id, err
-                )
+                logger.warning("cannot edit progress window in chat %s: %s", window.chat_id, err)
 
     async def _close(self, window: _Window) -> None:
         """The chat's queue drained: delete the window (receipts stay)."""
@@ -407,8 +420,34 @@ class Notifier:
         if not await self._send_receipt(group, text):
             logger.warning(
                 "could not deliver the receipt for group %s to chat %s",
-                group.key, group.chat_id,
+                group.key,
+                group.chat_id,
             )
+            return
+        # The receipt just became the newest message in the chat — move the
+        # live window below it (debounced, same as an intake kick) so the
+        # progress frame is always the LAST message, never drifting up.
+        self._reanchor(group.chat_id)
+
+    def reanchor(self, chat_id: int) -> None:
+        """Public bottom-anchor: move the chat's live window below the last
+        bot message (call after any send that is meant to be read)."""
+        self._reanchor(chat_id)
+
+    def _reanchor(self, chat_id: int) -> None:
+        """Schedule a delete + resend of the chat's window (bottom anchor).
+
+        No-op unless the chat still has live work — when the last job of a
+        session finishes, its receipt *is* the right bottom message and the
+        window is closed instead.
+        """
+        window = self._windows.get(chat_id)
+        if window is None or window.broken or not window.live:
+            return
+        when = time.monotonic() + _WINDOW_DEBOUNCE
+        if window.kick_at is None or window.kick_at > when:
+            window.kick_at = when
+        self._ensure_updater(window)
 
     async def _send_receipt(self, group: _Group, text: str) -> bool:
         """Deliver the receipt as a new message, waiting out one flood-wait.
@@ -424,9 +463,7 @@ class Notifier:
             except TelegramRetryAfter as err:
                 if attempt == 2:
                     break
-                await asyncio.sleep(
-                    min(float(err.retry_after or 1), _RECEIPT_MAX_WAIT)
-                )
+                await asyncio.sleep(min(float(err.retry_after or 1), _RECEIPT_MAX_WAIT))
             except Exception as err:  # noqa: BLE001
                 logger.warning("cannot send receipt to chat %s: %s", group.chat_id, err)
                 return False
@@ -435,7 +472,7 @@ class Notifier:
     # ── window keyboard ─────────────────────────────────────────────────────
 
     def _keyboard(self, window: _Window) -> InlineKeyboardMarkup | None:
-        """The window's remote-control row (None when no manager is bound).
+        """The window's remote-control rows (None when no manager is bound).
 
         The same buttons ride along on every send AND every edit — an
         edit_message_text without ``reply_markup`` would strip them. The
@@ -447,22 +484,23 @@ class Notifier:
         if manager is None:
             return None
         paused = bool(getattr(manager, "paused", False))
-        row1 = [
-            InlineKeyboardButton(
-                text="▶️ Resume" if paused else "⏸ Pause",
-                callback_data=_CB + ("resume" if paused else "pause"),
-            ),
-            InlineKeyboardButton(text="📋 Queue", callback_data=_CB + "queue"),
-            InlineKeyboardButton(text="📊 Stats", callback_data=_CB + "stats"),
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text="▶\ufe0f Resume" if paused else "⏸ Pause",
+                    callback_data=_CB + ("resume" if paused else "pause"),
+                ),
+            ]
         ]
-        rows = [row1]
         if window.live:
-            rows.append([
-                InlineKeyboardButton(text="✖️ Cancel", callback_data=_CB + "cancel"),
+            rows[0].append(InlineKeyboardButton(text="✖ Cancel all", callback_data=_CB + "cancel"))
+        rows.append(
+            [
+                InlineKeyboardButton(text="📋 Queue", callback_data=_CB + "queue"),
+                InlineKeyboardButton(text="📊 Stats", callback_data=_CB + "stats"),
                 InlineKeyboardButton(text="❓ Help", callback_data=_CB + "help"),
-            ])
-        else:
-            rows.append([InlineKeyboardButton(text="❓ Help", callback_data=_CB + "help")])
+            ]
+        )
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     # ── text builders ───────────────────────────────────────────────────────
@@ -473,6 +511,7 @@ class Notifier:
         return job.status is JobStatus.RUNNING or job.waiting_since is not None
 
     def _window_text(self, window: _Window) -> str:
+        """One glanceable frame: header chips, live blocks, queued summary."""
         live = sorted(window.live.values(), key=lambda j: j.seq)
         # Collapse each album into one display entry — ten near-identical
         # lines for one media group is noise, one bar with sums is signal.
@@ -483,45 +522,60 @@ class Notifier:
         queued_jobs = [j for j in live if not self._is_active(j)]
 
         active_count = sum(1 for j in live if self._is_active(j))
-        parts: list[str] = []
+        chips: list[str] = []
         if active_count:
-            parts.append(f"{active_count} active")
+            chips.append(f"{active_count} active")
         if queued_jobs:
-            parts.append(f"{len(queued_jobs)} queued")
+            chips.append(f"{len(queued_jobs)} queued")
         if window.done:
-            parts.append(f"{window.done} done")
+            chips.append(f"{window.done} done")
         if window.failed:
-            parts.append(f"{window.failed} failed")
+            chips.append(f"{window.failed} failed")
         if window.cancelled:
-            parts.append(f"{window.cancelled} cancelled")
+            chips.append(f"{window.cancelled} cancelled")
         header = "🐝 <b>TellyBee</b>"
         if self._manager is not None and getattr(self._manager, "paused", False):
             header += " · <b>⏸ paused</b>"
-        if parts:
-            header += f" — {' · '.join(parts)}"
+        if chips:
+            header += f"\n{' · '.join(chips)}"
         volume = sum((j.total_bytes or j.file_size or 0) for j in live)
         if volume:
             header += f" · {human_size(volume)}"
         lines: list[str] = [header]
+        if active_entries or queued_jobs:
+            lines.append(_DIVIDER)
 
         shown = 0
         for jobs in active_entries[:_MAX_ACTIVE_ENTRIES]:
+            if shown:
+                lines.append("")  # breathing room between file blocks
             lines.extend(self._entry_lines(jobs))
             shown += 1
         if len(active_entries) > shown:
-            lines.append(f"… +{len(active_entries) - shown} more in progress")
+            lines.append(f"<i>… +{len(active_entries) - shown} more in progress</i>")
 
         if queued_jobs:
-            names = ", ".join(
-                escape(_short(j.file_name or j.rel_path, 24)) for j in queued_jobs[:3]
+            if active_entries:
+                lines.append("")
+            queued_bytes = sum((j.file_size or 0) for j in queued_jobs)
+            size_part = f" · {human_size(queued_bytes)}" if queued_bytes else ""
+            names = " · ".join(
+                escape(_short(j.file_name or j.rel_path, 22)) for j in queued_jobs[:3]
             )
             hidden = len(queued_jobs) - 3
-            suffix = f" +{hidden} more" if hidden > 0 else ""
-            lines.append(f"⏳ <b>Queued</b> — {names}{suffix}")
+            suffix = f" +{hidden}" if hidden > 0 else ""
+            lines.append(f"⏳ <b>Queued</b> · {plural_files(len(queued_jobs))}{size_part}")
+            if names:
+                lines.append(f"<blockquote>{names}{suffix}</blockquote>")
         return "\n".join(lines)
 
     def _entry_lines(self, jobs: list[DownloadJob]) -> list[str]:
-        """Detailed block for one active job or one collapsed album."""
+        """Detailed block for one active job or one collapsed album.
+
+        Both transport phases of local Bot API mode render identically:
+        a progress bar plus a meta line. Users never see the internal
+        split between the server-side fetch and the local copy.
+        """
         first = jobs[0]
         icon = type_icon(first.media_type)
         name = _short(first.file_name or first.rel_path, 44)
@@ -529,10 +583,10 @@ class Notifier:
             name = f"{name} +{len(jobs) - 1}"
         lines = [f"{icon} <b>{escape(name)}</b>"]
 
-        # Phase 1 — the local Bot API server fetching from Telegram (the
-        # getFile wait). The engine's volume watcher fills fetch_done /
-        # fetch_speed, so this is real progress; without it degrade to a
-        # growing elapsed counter, never a frozen 0% bar.
+        # Phase 1 — the server pulling the file from Telegram. The engine's
+        # volume watcher fills fetch_done / fetch_speed, so this is real
+        # progress; without it degrade to a preparing indicator, never a
+        # frozen 0% bar.
         waiting = [j for j in jobs if j.waiting_since is not None]
         if waiting:
             fetch_total = sum(j.fetch_total or j.file_size or 0 for j in waiting)
@@ -541,19 +595,16 @@ class Notifier:
             if fetch_total and fetch_done:
                 frac = min(1.0, fetch_done / fetch_total)
                 lines.append(f"<code>{progress_bar(frac)} {pct(frac)}</code>")
-                detail = (
-                    f"📡 Telegram fetch · {human_size(fetch_done)} / "
-                    f"{human_size(fetch_total)} · {human_speed(speed)}"
+                meta = (
+                    f"{human_size(fetch_done)} / {human_size(fetch_total)} · {human_speed(speed)}"
                 )
                 if speed > 0 and frac < 1.0:
-                    detail += f" · ETA {fmt_eta((fetch_total - fetch_done) / speed)}"
-                lines.append(detail)
+                    meta += f" · ETA {fmt_eta((fetch_total - fetch_done) / speed)}"
+                lines.append(meta)
             else:
                 elapsed = max(time.monotonic() - j.waiting_since for j in waiting)
-                lines.append(
-                    f"📡 fetching from Telegram · {fmt_eta(elapsed)} so far "
-                    "(first-time big downloads take a while)"
-                )
+                lines.append(f"<code>{progress_bar(0.0)} 0%</code>")
+                lines.append(f"⏳ Preparing · {fmt_eta(elapsed)}")
             return lines
 
         # Phase 2 — the transfer itself (cloud mode, or the fast local copy).
@@ -567,15 +618,16 @@ class Notifier:
             if total:
                 frac = min(1.0, done / total)
                 lines.append(f"<code>{progress_bar(frac)} {pct(frac)}</code>")
-                detail = f"{human_size(done)} / {human_size(total)} · {human_speed(speed)}"
+                meta = f"{human_size(done)} / {human_size(total)} · {human_speed(speed)}"
                 if speed > 0 and frac < 1.0:
-                    detail += f" · ETA {fmt_eta((total - done) / speed)}"
-                lines.append(detail)
+                    meta += f" · ETA {fmt_eta((total - done) / speed)}"
+                lines.append(meta)
             else:
-                lines.append("⏬ transferring…")
+                lines.append("⏬ Downloading…")
         return lines
 
     def _receipt_text(self, group: _Group) -> str:
+        """The permanent record of one file / album: header, list, footer."""
         results = group.results
         completed = [j for j in results if j.status is JobStatus.COMPLETED]
         failed = [j for j in results if j.status is JobStatus.FAILED]
@@ -588,69 +640,58 @@ class Notifier:
             if len(completed) > 1:
                 header = f"✅ <b>Saved {plural_files(len(completed))}</b> · {volume}"
             else:
-                header = f"✅ <b>Saved</b> — {volume}"
-            lines.append(header)
+                header = f"✅ <b>Saved</b> · {volume}"
         elif completed:
-            lines.append(
-                f"⚠️ <b>Saved {len(completed)}/{len(results)}</b> · {human_size(total_bytes)}"
-            )
+            header = f"✅ <b>Saved {len(completed)}/{len(results)}</b> · {human_size(total_bytes)}"
         elif cancelled and not failed:
-            lines.append(f"🚫 <b>Cancelled</b> {plural_files(len(cancelled))}")
+            header = f"🚫 <b>Cancelled</b> · {plural_files(len(cancelled))}"
         else:
-            lines.append("❌ <b>Download failed</b>")
+            header = "❌ <b>Download failed</b>"
+        lines.append(header)
 
-        shown = 0
-        for job in completed[:10]:
-            lines.append(self._receipt_line(job))
-            shown += 1
-        for job in failed[:4]:
-            lines.append(self._receipt_line(job))
-            shown += 1
+        # The file list, quoted — long album lists collapse behind the
+        # "expand" arrow instead of flooding the chat.
+        body = [self._receipt_line(job) for job in completed[:10]]
+        body += [self._receipt_line(job) for job in failed[:4]]
         if len(completed) > 10:
-            lines.append(f"… and {len(completed) - 10} more")
+            body.append(f"… and {len(completed) - 10} more")
+        if body:
+            quote = "\n".join(body)
+            opening = "blockquote expandable" if len(body) > 5 else "blockquote"
+            lines.append(f"<{opening}>{quote}</blockquote>")
 
         if completed:
-            # Honest speeds: a file that finished fetching while still queued
-            # (prefetch) is "transferred" by an instant local copy — report
-            # the Telegram fetch speed instead of flashing a meaningless
-            # "250 MB/s" disk-copy figure, and say which files were ready
-            # ahead of time.
-            ahead = [j for j in completed if j.fetched_ahead]
+            # Honest speeds, quietly: a file that finished while still
+            # queued (prefetch) was "transferred" by an instant local copy —
+            # report its real transfer speed instead of a meaningless disk
+            # burst. Where the number came from is an implementation detail.
             speeds = [j.fetch_bps if j.fetched_ahead else j.avg_speed for j in completed]
             speeds = [s for s in speeds if s]
             if speeds:
                 average = sum(speeds) / len(speeds)
-                if len(ahead) == len(completed):
-                    lines.append(
-                        f"⚡ {human_speed(average)} from Telegram — fetched "
-                        "ahead of the queue, copy was instant"
-                    )
-                elif ahead:
-                    lines.append(
-                        f"⚡ {human_speed(average)} average · {len(ahead)} prefetched"
-                    )
-                else:
-                    lines.append(f"⚡ {human_speed(average)} average")
-            elif ahead:
-                lines.append("⚡ instant — already in the local server cache")
-        job_ids = " ".join(f"#{j.job_id}" for j in results[:5])
-        if job_ids:
-            lines.append(f"🧷 {job_ids}")
+                suffix = " average" if len(completed) > 1 else ""
+                lines.append(f"⚡ <b>{human_speed(average)}</b>{suffix}")
 
-        directory = self._common_dir([j for j in completed]) or (
+        job_ids = " ".join(f"<code>#{j.job_id}</code>" for j in results[:5])
+        directory = self._common_dir(completed) or (
             completed[0].rel_path.rsplit("/", 1)[0] if completed else ""
         )
+        footer = []
+        if job_ids:
+            footer.append(f"🧷 {job_ids}")
         if directory:
-            lines.append(f"📁 <code>{escape(directory)}</code>")
+            footer.append(f"📁 <code>{escape(directory)}</code>")
+        if footer:
+            lines.append(" · ".join(footer))
         return "\n".join(lines)
 
     def _receipt_line(self, job: DownloadJob) -> str:
         icon = type_icon(job.media_type)
         name = escape(job.file_name or job.rel_path)
         if job.status is JobStatus.COMPLETED:
-            return f"{icon} {name} — {human_size(job.bytes_done or job.file_size)}"
+            return f"{icon} {name} · {human_size(job.bytes_done or job.file_size)}"
         if job.status is JobStatus.CANCELLED:
-            return f"🚫 {name} — cancelled"
+            return f"🚫 {name} · cancelled"
         return f"❌ {name} — {escape((job.error or 'error')[:80])}"
 
     @staticmethod

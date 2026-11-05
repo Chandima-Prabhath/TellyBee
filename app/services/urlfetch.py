@@ -120,9 +120,7 @@ def _rate_limited_error(resp: aiohttp.ClientResponse) -> _RateLimited:
 
 def _is_rate_limit_status(resp: aiohttp.ClientResponse) -> bool:
     """429 always; 503 only when the server says when to come back."""
-    return resp.status == 429 or (
-        resp.status == 503 and bool(resp.headers.get("Retry-After"))
-    )
+    return resp.status == 429 or (resp.status == 503 and bool(resp.headers.get("Retry-After")))
 
 
 def _retry_after(headers: Mapping[str, str]) -> float | None:
@@ -487,13 +485,13 @@ class UrlDownloader:
                 rate_waited += delay
                 logger.info(
                     "probe rate limited (HTTP %d) — waiting %.0fs before trying %s again",
-                    err.status, delay, strip_query(url),
+                    err.status,
+                    delay,
+                    strip_query(url),
                 )
                 await asyncio.sleep(delay)
 
-    async def _probe_from_response(
-        self, resp: aiohttp.ClientResponse, url: str
-    ) -> ProbeResult:
+    async def _probe_from_response(self, resp: aiohttp.ClientResponse, url: str) -> ProbeResult:
         if resp.status == 206:
             total = _total_from_content_range(resp.headers.get("Content-Range", ""))
             await resp.read()  # the single probe byte
@@ -530,8 +528,7 @@ class UrlDownloader:
         probe = await self.probe(url)
         if cap and probe.size and probe.size > cap:
             raise UrlRejected(
-                f"{human_size(probe.size)} exceeds the LINK_MAX_SIZE cap "
-                f"of {human_size(cap)}"
+                f"{human_size(probe.size)} exceeds the LINK_MAX_SIZE cap of {human_size(cap)}"
             )
 
         target = Path(job.target_path)
@@ -631,7 +628,9 @@ class UrlDownloader:
         bounds = self._split(size, parts)
         logger.info(
             "job #%s: downloading %s over %d parallel range connections",
-            job.job_id, human_size(size), len(bounds),
+            job.job_id,
+            human_size(size),
+            len(bounds),
         )
         loop = asyncio.get_running_loop()
         # Mutable per-part offsets so a throttled parallel run can finish
@@ -639,16 +638,19 @@ class UrlDownloader:
         progress = [[start] for start, _ in bounds]
         with part_file.open("w+b") as fh:
             # Preallocate so parallel pwrites land at their final offsets.
-            await loop.run_in_executor(
-                None, functools.partial(os.ftruncate, fh.fileno(), size)
-            )
+            await loop.run_in_executor(None, functools.partial(os.ftruncate, fh.fileno(), size))
             rate_error: _RateLimited | None = None
             try:
                 async with asyncio.TaskGroup() as tg:
                     for index, (start, end) in enumerate(bounds):
                         tg.create_task(
                             self._download_part(
-                                session, probe.final_url, start, end, fh, job,
+                                session,
+                                probe.final_url,
+                                start,
+                                end,
+                                fh,
+                                job,
                                 progress=progress[index],
                                 first_delay=index * _PART_START_STAGGER,
                             )
@@ -670,7 +672,8 @@ class UrlDownloader:
                 logger.warning(
                     "job #%s: parallel ranges throttled (%s) — finishing the "
                     "remaining bytes over a single connection",
-                    job.job_id, strip_query(str(rate_error)),
+                    job.job_id,
+                    strip_query(str(rate_error)),
                 )
                 await self._sleep_cancellable(
                     job, min(rate_error.retry_after or _RATE_FALLBACK_COOLDOWN, 30.0)
@@ -705,15 +708,27 @@ class UrlDownloader:
                 continue  # this range finished during the parallel phase
             logger.info(
                 "job #%s: finishing range %d-%d sequentially from offset %d",
-                job.job_id, start, end, offset,
+                job.job_id,
+                start,
+                end,
+                offset,
             )
             await self._download_part(
-                session, url, offset, end, fh, job,
-                progress=progress[index], deadline=deadline,
+                session,
+                url,
+                offset,
+                end,
+                fh,
+                job,
+                progress=progress[index],
+                deadline=deadline,
             )
 
     async def _get_with_rate_patience(
-        self, session: aiohttp.ClientSession, url: str, job: DownloadJob,
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        job: DownloadJob,
         headers: dict[str, str] | None = None,
     ) -> aiohttp.ClientResponse:
         """One GET, waiting out rate limits (bounded) instead of failing.
@@ -726,22 +741,22 @@ class UrlDownloader:
         attempt = 0
         while True:
             attempt += 1
-            resp = await session.get(
-                url, headers=headers or {}, allow_redirects=True
-            )
+            resp = await session.get(url, headers=headers or {}, allow_redirects=True)
             if not _is_rate_limit_status(resp):
                 return resp
             err = _rate_limited_error(resp)
             resp.close()
-            delay = err.retry_after or _RATE_LIMIT_DELAYS[
-                min(attempt - 1, len(_RATE_LIMIT_DELAYS) - 1)
-            ]
+            delay = (
+                err.retry_after or _RATE_LIMIT_DELAYS[min(attempt - 1, len(_RATE_LIMIT_DELAYS) - 1)]
+            )
             if rate_waited + delay > _RATE_LIMIT_BUDGET or attempt > 10:
                 raise err
             rate_waited += delay
             logger.info(
                 "job #%s: GET rate limited (HTTP %d) — waiting %.0fs",
-                job.job_id, err.status, delay,
+                job.job_id,
+                err.status,
+                delay,
             )
             await self._sleep_cancellable(job, delay)
 
@@ -785,16 +800,15 @@ class UrlDownloader:
                         # pwrite is positional → safe to share one fd across
                         # parallel parts (each in the executor's own thread).
                         await loop.run_in_executor(
-                            None, functools.partial(os.pwrite, fh.fileno(), chunk, offset)  # type: ignore[attr-defined]
+                            None,
+                            functools.partial(os.pwrite, fh.fileno(), chunk, offset),  # type: ignore[attr-defined]
                         )
                         offset += len(chunk)
                         if progress is not None:
                             progress[0] = offset
                         job.touch_progress(len(chunk))
                 if offset < end + 1:
-                    raise aiohttp.ClientPayloadError(
-                        f"range {start}-{end} ended early at {offset}"
-                    )
+                    raise aiohttp.ClientPayloadError(f"range {start}-{end} ended early at {offset}")
                 if progress is not None:
                     progress[0] = offset
                 return
@@ -807,9 +821,7 @@ class UrlDownloader:
                     progress[0] = offset
                 delay = err.retry_after
                 if delay is None:
-                    delay = _RATE_LIMIT_DELAYS[
-                        min(rate_attempt, len(_RATE_LIMIT_DELAYS) - 1)
-                    ]
+                    delay = _RATE_LIMIT_DELAYS[min(rate_attempt, len(_RATE_LIMIT_DELAYS) - 1)]
                 rate_attempt += 1
                 if rate_waited + delay > _RATE_LIMIT_BUDGET:
                     raise  # patience exhausted — caller goes sequential
@@ -819,7 +831,13 @@ class UrlDownloader:
                 logger.info(
                     "job #%s: range %d-%d rate limited (HTTP %d) — waiting "
                     "%.0fs (waited %.0fs so far), resuming from offset %d",
-                    job.job_id, start, end, err.status, delay, rate_waited, offset,
+                    job.job_id,
+                    start,
+                    end,
+                    err.status,
+                    delay,
+                    rate_waited,
+                    offset,
                 )
                 await self._sleep_cancellable(job, delay)
             except (TimeoutError, aiohttp.ClientError, OSError) as err:
@@ -830,10 +848,14 @@ class UrlDownloader:
                 delay = _PART_RETRY_DELAYS[transient]
                 transient += 1
                 logger.warning(
-                    "job #%s: range %d-%d attempt %d failed (%s: %s) — resuming "
-                    "from offset %d",
-                    job.job_id, start, end, transient,
-                    type(err).__name__, strip_query(str(err)), offset,
+                    "job #%s: range %d-%d attempt %d failed (%s: %s) — resuming from offset %d",
+                    job.job_id,
+                    start,
+                    end,
+                    transient,
+                    type(err).__name__,
+                    strip_query(str(err)),
+                    offset,
                 )
                 await self._sleep_cancellable(job, delay)
 
@@ -867,9 +889,7 @@ class UrlDownloader:
         return bounds
 
     @staticmethod
-    async def _check_response(
-        resp: aiohttp.ClientResponse, expect_206: bool = False
-    ) -> None:
+    async def _check_response(resp: aiohttp.ClientResponse, expect_206: bool = False) -> None:
         if expect_206 and resp.status != 206:
             if _is_rate_limit_status(resp):
                 # The probe said ranges work, but the server is now telling

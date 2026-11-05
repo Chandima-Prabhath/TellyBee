@@ -12,9 +12,13 @@ from aiogram.types import Message
 from app.config import Settings
 from app.db import Database
 from app.queue.manager import DownloadManager, QueueFullError, build_job
-from app.services.filenaming import ChatInfo, UserRef, resolve_destination
+from app.services.filenaming import (
+    ChatInfo,
+    UserRef,
+    resolve_destination,
+)
 from app.services.media_types import extract_media
-from app.utils.formatting import escape
+from app.utils.formatting import escape, plural_files
 from app.utils.sizes import human_size
 
 logger = logging.getLogger(__name__)
@@ -26,6 +30,35 @@ _MEDIA_FILTER = (
 )
 
 _nudge_cache: dict[int, float] = {}
+
+#: Newline constant usable inside f-string expressions (readability).
+NEWLINE = "\n"
+
+
+async def destination_for(
+    settings: Settings, db: Database | None, user_ref: UserRef, media, chat_info: ChatInfo
+):
+    """Resolve where a new download lands, honoring the user's /folder pref.
+
+    Preference lookup is best-effort: a DB hiccup falls back to the
+    default template rather than blocking the intake.
+    """
+    single, name = False, None
+    if db is not None:
+        try:
+            mode, name = await db.get_folder_pref(user_ref.id)
+            single = mode == "single"
+        except Exception:  # noqa: BLE001 — never block intake on prefs
+            logger.debug("folder pref lookup failed for %s", user_ref.id, exc_info=True)
+    return resolve_destination(
+        settings.download_dir,
+        settings.file_template,
+        user_ref,
+        media,
+        chat_info,
+        single_folder=single,
+        folder_name=name,
+    )
 
 
 @router.message(_MEDIA_FILTER)
@@ -92,9 +125,7 @@ async def receive_media(
     queued_ids: list[str] = []
     for msg, media in accepted:
         user_ref = UserRef(user.id, user.username, user.first_name)
-        target, rel = resolve_destination(
-            settings.download_dir, settings.file_template, user_ref, media, chat_info
-        )
+        target, rel = await destination_for(settings, db, user_ref, media, chat_info)
         job = build_job(
             user=user_ref,
             chat_id=message.chat.id,
@@ -120,7 +151,9 @@ async def receive_media(
 
     logger.info(
         "accepted %d file(s) from user %s in chat %s",
-        len(queued_ids), user.id, message.chat.id,
+        len(queued_ids),
+        user.id,
+        message.chat.id,
     )
 
 
@@ -163,21 +196,21 @@ async def _already_saved(
 
 
 async def _reply_duplicates(message: Message, duplicates: list[tuple[str, str]]) -> None:
-    lines = [f"♻️ <b>Already saved</b> — skipped {len(duplicates)} duplicate(s)"]
-    for name, saved in duplicates[:8]:
-        lines.append(f"• {escape(name)} → <code>{escape(saved)}</code>")
+    lines = [f"♻️ <b>Already saved</b> · skipped {plural_files(len(duplicates))}"]
+    body = [f"{escape(name)} → <code>{escape(saved)}</code>" for name, saved in duplicates[:8]]
     if len(duplicates) > 8:
-        lines.append(f"… and {len(duplicates) - 8} more")
+        body.append(f"… and {len(duplicates) - 8} more")
+    lines.append(f"<blockquote>{NEWLINE.join(body)}</blockquote>")
     await message.answer("\n".join(lines))
 
 
 async def _reply_rejections(message: Message, rejections, partial: bool) -> None:
     header = "⚠️ <b>Skipped</b>" if partial else "⛔️ <b>Can't accept</b>"
     lines = [header]
-    for name, reason in rejections[:8]:
-        lines.append(f"• {escape(name)} — {reason}")
+    body = [f"{escape(name)} — {escape(reason)}" for name, reason in rejections[:8]]
     if len(rejections) > 8:
-        lines.append(f"… and {len(rejections) - 8} more")
+        body.append(f"… and {len(rejections) - 8} more")
+    lines.append(f"<blockquote>{NEWLINE.join(body)}</blockquote>")
     await message.answer("\n".join(lines))
 
 
@@ -190,6 +223,5 @@ async def fallback(message: Message) -> None:
         return
     _nudge_cache[user_id] = now
     await message.answer(
-        "🤖 I only understand files and media.\n"
-        "Send me a photo, video, document… or try /help 🐝"
+        "🤖 I only understand files and media.\nSend me a photo, video, document… or try /help"
     )

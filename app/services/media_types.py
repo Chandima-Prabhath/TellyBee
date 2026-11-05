@@ -41,7 +41,7 @@ class MediaInfo:
             guessed = mimetypes.guess_extension(self.mime_type)
             if guessed:
                 # Normalize a couple of ugly stdlib guesses.
-                return {".jpe": ".jpg", ".oga": ".ogg",".webm": ".webm"}.get(guessed, guessed)
+                return {".jpe": ".jpg", ".oga": ".ogg", ".webm": ".webm"}.get(guessed, guessed)
         return _DEFAULT_EXT.get(self.kind, ".bin")
 
 

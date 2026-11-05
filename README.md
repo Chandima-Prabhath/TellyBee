@@ -36,15 +36,21 @@ Built on **aiogram 3** (fully async), **Python 3.12**, and a
   Queue, Stats, Cancel, Help) does the job of the `/commands`, no typing
   needed. Permissions mirror the commands exactly (stats/pause are
   admin-only, users cancel their own files).
+- 📌 **The window stays pinned to the bottom** — every receipt or button
+  reply re-anchors it as the newest message in the chat, so live progress
+  never drifts out of view while a long queue runs.
+- 🗂 **Per-user folder layout** — `/folder` switches between organized
+  template folders and **one flat folder** (`/folder Show Name` gives a
+  series its own folder so episodes forwarded across days stay together).
 - 🔁 **Survives reboots** — a startup reconciliation pass marks unfinished
   jobs *interrupted*, sweeps orphaned `.part` files, and sends each chat a
   report with a **Re-queue** button that restores the lost jobs from the
   ledger — no re-forwarding needed.
 - 🎛 **Two-tier access control** — env-seeded admins & users, plus runtime
   `/allow` / `/disallow` / `/users` management persisted in SQLite.
-- 🗂 **Flexible storage layout** — configurable folder template like
+- 🗂 **Flexible storage layout** — a configurable folder template like
   `{user}/{type}/{date}` with path-safety sanitization and collision-proof
-  naming.
+  naming, plus each user's own `/folder` override.
 - 🚦 **Flood-safe** — per-user throttling, bounded queue, file-type filters,
   size limits with friendly rejections.
 - ❤️ **Ops-friendly** — HTTP `/healthz` endpoint with queue metrics
@@ -128,6 +134,7 @@ python -m app.main --check
 | `/start` | everyone | welcome card + your access level |
 | `/help` | everyone | usage guide, limits, storage layout |
 | `/link <url>` | everyone | download a direct http(s) link (or just send the URL as text) |
+| `/folder [name]` | everyone | choose where downloads go — one folder (optionally named, ideal for series) or default template folders |
 | `/status` | everyone | your 10 most recent downloads |
 | `/queue` | everyone* | live queue monitor (*users see only their own jobs) |
 | `/cancel <id>` | everyone* | cancel a running or pending download |
@@ -141,19 +148,27 @@ python -m app.main --check
 
 **What a download looks like in chat** — one live *window* message per chat,
 not a notification per file. Forward a new task and the previous window is
-replaced by a fresh one directly under your message; while anything is
-running it updates in place; when the queue drains it disappears and only
-the receipts (the permanent records) remain:
+replaced by a fresh one directly under your message; while anything runs it
+updates in place; after every receipt (or button reply) it **re-anchors
+itself as the newest message** so progress is always at the bottom of the
+chat; when the queue drains it disappears and only the receipts (the
+permanent records) remain:
 
 ```
-🐝 TellyBee — 2 active · 5 queued · 8 done · 12.3 GB
+🐝 TellyBee
+2 active · 5 queued · 8 done · 12.3 GB
+──────────────────────
 🎬 E03.mkv
 ▰▰▰▰▱▱▱▱▱▱ 42% · 890 MB / 2.1 GB · 9.2 MB/s · ETA 2m 04s
-📡 E04.mkv — Telegram fetch · 310 MB / 1.7 GB · 4.1 MB/s
-⏳ Queued — E05.mkv, E06.mkv +3 more
 
-[ ⏸ Pause ] [ 📋 Queue ] [ 📊 Stats ]
-[ ✖️ Cancel ] [ ❓ Help ]
+📄 E04.mkv
+▰▰▰▰▰▰▰▰▱▱ 84% · 1.4 GB / 1.7 GB · 4.1 MB/s
+
+⏳ Queued · 5 files · 7.9 GB
+> E05.mkv · E06.mkv · E07.mkv +2
+
+[ ⏸ Pause · ✖ Cancel all ]
+[ 📋 Queue · 📊 Stats · ❓ Help ]
 ```
 
 The bottom rows are **inline buttons** — the window doubles as the bot's
@@ -162,32 +177,39 @@ remote control (see *Reboots & recovery* below for the Re-queue button):
 | Button | Who | Effect |
 |---|---|---|
 | ⏸ Pause / ▶️ Resume | admin | same as `/pause` / `/resume`; the button flips and the header shows ⏸ paused |
+| ✖ Cancel all | everyone* | cancels the chat's downloads (users: own files only) |
 | 📋 Queue | everyone | same view as `/queue` (users see their own jobs) |
 | 📊 Stats | admin | same as `/stats` |
-| ✖️ Cancel | everyone* | cancels the chat's downloads (users: own files only) |
 | ❓ Help | everyone | same as `/help` |
 
 Commands still work everywhere — the buttons are a shortcut, not a
 replacement.
 
 With a local Bot API server, big first-time downloads show the server-side
-fetch as real progress (watched on the shared volume) before the fast local
-copy takes over:
+fetch as **real progress** (watched on the shared volume) before the fast
+local copy takes over — to the user it is simply one download bar; if the
+watcher has no numbers yet, the window says so instead of freezing:
 
 ```
-📡 fetching from Telegram · 1m 33s so far (first-time big downloads take a while)
+⏳ Preparing · 1m 33s
 ```
 
 When everything finishes, the window is deleted and each file/album leaves
-its receipt behind:
+its receipt behind — file lists arrive as quoted blocks (long album lists
+collapse behind Telegram's expandable quote):
 
 ```
 ✅ Saved — 27.4 MB
-🎬 clip.mp4 — 27.4 MB
+> 🎬 clip.mp4 · 27.4 MB
+
 ⚡ 3.9 MB/s average
-🧷 #a3f9c2
-📁 chandima/video/2026-10-13
+🧷 #a3f9c2 · 📁 chandima/video/2026-10-13
 ```
+
+**Keeping a series together** — set it once with `/folder Severance S02`
+and every episode lands in `downloads/<user>/Severance S02/`, no matter
+which day you forward it. `/folder` (no argument) shows a picker with two
+layout buttons; `reset` returns to the default template.
 
 ---
 

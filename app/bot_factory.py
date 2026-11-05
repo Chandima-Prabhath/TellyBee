@@ -34,6 +34,7 @@ _USER_COMMANDS = [
     BotCommand(command="start", description="Welcome & capabilities"),
     BotCommand(command="help", description="Usage guide and limits"),
     BotCommand(command="link", description="Download a direct http(s) link"),
+    BotCommand(command="folder", description="Choose where downloads are saved"),
     BotCommand(command="status", description="Your recent downloads"),
     BotCommand(command="queue", description="Live download monitor"),
     BotCommand(command="cancel", description="Cancel a download by id"),
@@ -77,8 +78,7 @@ async def cloud_logout(token: str, *, base: str = CLOUD_API_BASE, timeout: float
                     )
                     return True
                 logger.info(
-                    "cloud logOut response: %s — fine, the bot is probably already "
-                    "logged out",
+                    "cloud logOut response: %s — fine, the bot is probably already logged out",
                     payload.get("description") or f"HTTP {resp.status}",
                 )
                 return False

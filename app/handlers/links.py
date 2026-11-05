@@ -26,10 +26,10 @@ from aiogram.types import Message
 
 from app.config import Settings
 from app.db import Database
-from app.handlers.media import _reply_duplicates, _reply_rejections
+from app.handlers.media import _reply_duplicates, _reply_rejections, destination_for
 from app.queue.errors import DownloadError
 from app.queue.manager import DownloadManager, QueueFullError, build_job
-from app.services.filenaming import ChatInfo, UserRef, resolve_destination
+from app.services.filenaming import ChatInfo, UserRef
 from app.services.media_types import MediaInfo
 from app.services.urlfetch import UrlRejected, _RateLimited
 from app.utils.formatting import escape
@@ -53,14 +53,13 @@ async def cmd_link(
 ) -> None:
     if not settings.links_enabled:
         await message.answer(
-            "🔗 Link downloads are disabled on this server "
-            "(LINKS_ENABLED=false)."
+            "🔗 <b>Link downloads are disabled</b> on this server\n(LINKS_ENABLED=false)."
         )
         return
     raw = (command.args or "").strip()
     if not raw:
         await message.answer(
-            "ℹ️ Usage: <code>/link https://example.com/file.zip</code>\n"
+            "ℹ️ <b>Usage:</b> <code>/link https://example.com/file.zip</code>\n"
             "Or just send a message containing an http(s) link."
         )
         return
@@ -85,7 +84,7 @@ async def receive_links(
         return
     if len(urls) > _MAX_URLS_PER_MESSAGE:
         await message.answer(
-            f"🔗 I take at most {_MAX_URLS_PER_MESSAGE} links per message — "
+            f"🔗 I take at most <b>{_MAX_URLS_PER_MESSAGE}</b> links per message — "
             f"fetching the first {_MAX_URLS_PER_MESSAGE}."
         )
         urls = urls[:_MAX_URLS_PER_MESSAGE]
@@ -124,8 +123,11 @@ async def _handle_urls(
         except _RateLimited as err:
             waited = f" (retry after {err.retry_after:.0f}s)" if err.retry_after else ""
             rejections.append(
-                (label, f"the host is rate-limiting us (HTTP {err.status}){waited} — "
-                 "try again in a few minutes")
+                (
+                    label,
+                    f"the host is rate-limiting us (HTTP {err.status}){waited} — "
+                    "try again in a few minutes",
+                )
             )
             continue
         except (TimeoutError, aiohttp.ClientError, OSError) as err:
@@ -135,8 +137,10 @@ async def _handle_urls(
         name = probe.filename or label
         if cap and probe.size and probe.size > cap:
             rejections.append(
-                (name, f"{human_size(probe.size)} exceeds the LINK_MAX_SIZE cap "
-                       f"of {human_size(cap)}")
+                (
+                    name,
+                    f"{human_size(probe.size)} exceeds the LINK_MAX_SIZE cap of {human_size(cap)}",
+                )
             )
             continue
         if probe.size and headroom is not None and probe.size > headroom:
@@ -181,9 +185,7 @@ async def _handle_urls(
     user_ref = UserRef(user.id, user.username, user.first_name)
     queued_ids: list[str] = []
     for media in accepted:
-        target, rel = resolve_destination(
-            settings.download_dir, settings.file_template, user_ref, media, chat_info
-        )
+        target, rel = await destination_for(settings, db, user_ref, media, chat_info)
         job = build_job(
             user=user_ref,
             chat_id=message.chat.id,
@@ -209,7 +211,9 @@ async def _handle_urls(
 
     logger.info(
         "accepted %d link(s) from user %s in chat %s",
-        len(queued_ids), user.id, message.chat.id,
+        len(queued_ids),
+        user.id,
+        message.chat.id,
     )
 
 

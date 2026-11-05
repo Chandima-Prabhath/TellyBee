@@ -15,7 +15,7 @@ from app.config import Settings
 from app.db import Database
 from app.queue.manager import DownloadManager
 from app.services.notifier import type_icon
-from app.utils.formatting import escape
+from app.utils.formatting import escape, plural_files
 from app.utils.sizes import human_size, human_speed
 
 logger = logging.getLogger(__name__)
@@ -40,44 +40,48 @@ async def cmd_stats(
 
 
 async def stats_text(db: Database, manager: DownloadManager, settings: Settings) -> str:
-    """The full statistics block — shared by /stats and the Stats button."""
+    """The full statistics card — shared by /stats and the Stats button."""
     stats = await db.global_stats()
     totals = stats["totals"]
-    lines = ["📊 <b>TellyBee stats</b>\n"]
+    divider = "─" * 22
+    lines = ["📊 <b>TellyBee · Statistics</b>", divider]
 
     lines.append(
-        f"💾 <b>All-time</b>\n"
-        f"• Files saved: {totals['completed']}\n"
-        f"• Volume: {human_size(totals['total_bytes'])}\n"
-        f"• Failed: {totals['failed']} · Cancelled: {totals['cancelled']}\n"
-        f"• Average speed: {human_speed(totals['avg_speed'])}"
+        "💾 <b>All-time</b>\n"
+        f"  <b>{totals['completed']}</b> {plural_files(totals['completed'])} saved · "
+        f"<b>{human_size(totals['total_bytes'])}</b>\n"
+        f"  {human_speed(totals['avg_speed'])} average · "
+        f"{totals['failed']} failed · {totals['cancelled']} cancelled"
     )
 
     last24 = stats["last_24h"]
     lines.append(
-        f"\n⏱ <b>Last 24h</b>\n"
-        f"• {last24['count']} files · {human_size(last24['bytes'])}"
+        f"\n⏱ <b>Last 24 hours</b>\n  {last24['count']} {plural_files(last24['count'])} · "
+        f"{human_size(last24['bytes'])}"
     )
 
     if stats["by_type"]:
-        lines.append("\n🗂 <b>By type</b>")
-        for row in stats["by_type"][:8]:
-            lines.append(
-                f"{type_icon(row['media_type'])} {row['media_type']}: "
-                f"{row['count']} · {human_size(row['bytes'])}"
-            )
+        body = [
+            f"{type_icon(row['media_type'])} {row['media_type']} — "
+            f"<b>{row['count']}</b> · {human_size(row['bytes'])}"
+            for row in stats["by_type"][:8]
+        ]
+        newline = "\n"
+        lines.append(f"\n🗂 <b>By type</b>\n<blockquote>{newline.join(body)}</blockquote>")
 
     if stats["top_users"]:
-        lines.append("\n🏆 <b>Top savers</b>")
-        for row in stats["top_users"]:
+        body = []
+        for rank, row in enumerate(stats["top_users"], start=1):
             name = escape(str(row["name"]))
-            lines.append(f"• {name}: {row['count']} · {human_size(row['bytes'])}")
+            body.append(f"{rank}. {name} — {row['count']} · {human_size(row['bytes'])}")
+        newline = "\n"
+        lines.append(f"\n🏆 <b>Top savers</b>\n<blockquote>{newline.join(body)}</blockquote>")
 
     snapshot = manager.snapshot()
     lines.append(
-        f"\n⚙️ <b>Now</b>\n"
-        f"• Workers {snapshot.workers_busy}/{snapshot.workers_total} · "
-        f"active {len(snapshot.active)} · pending {len(snapshot.pending)}"
+        "\n⚙️ <b>Now</b>\n"
+        f"  Workers <b>{snapshot.workers_busy}/{snapshot.workers_total}</b> · "
+        f"{len(snapshot.active)} active · {len(snapshot.pending)} pending"
         + (" · <b>PAUSED</b>" if snapshot.paused else "")
     )
 
@@ -92,9 +96,9 @@ async def stats_text(db: Database, manager: DownloadManager, settings: Settings)
             usage = await asyncio.to_thread(shutil.disk_usage, str(target))
         except OSError:
             continue
-        disk_parts.append(f"{label} {human_size(usage.free)} free")
+        disk_parts.append(f"{label} <b>{human_size(usage.free)}</b> free")
     if disk_parts:
-        lines.append(f"💾 <b>Disk</b>\n• {' · '.join(disk_parts)}")
+        lines.append("\n💾 <b>Disk</b>\n  " + " · ".join(disk_parts))
 
     return "\n".join(lines)
 
@@ -111,14 +115,18 @@ async def cmd_users(message: Message, db: Database) -> None:
     if not users:
         await message.answer("👥 No users configured — bot is in open access mode.")
         return
-    lines = ["👥 <b>Access list</b>\n"]
+    body = []
     for row in users:
         icon = "👑" if row["role"] == "admin" else "👤"
         name = escape(row["first_name"] or row["username"] or "")
         handle = f"@{escape(row['username'])}" if row["username"] else ""
-        lines.append(f"{icon} <code>{row['user_id']}</code> {name} {handle}")
-    lines.append("\n💡 /allow &lt;id&gt; or reply /allow to authorize someone.")
-    await message.answer("\n".join(lines))
+        body.append(f"{icon} <code>{row['user_id']}</code> {name} {handle}".rstrip())
+    newline = "\n"
+    await message.answer(
+        "👥 <b>Access list</b>\n"
+        f"{newline.join(body)}\n\n"
+        "💡 <code>/allow &lt;id&gt;</code> — or reply /allow to authorize someone."
+    )
 
 
 @router.message(Command("allow"))
@@ -133,11 +141,14 @@ async def cmd_allow(
         return
     user_id, username, first_name = target
     await db.upsert_user(
-        user_id, username=username, first_name=first_name, role="user",
+        user_id,
+        username=username,
+        first_name=first_name,
+        role="user",
         added_by=message.from_user.id,
     )
     await message.answer(
-        f"✅ Authorized <code>{user_id}</code>"
+        f"✅ <b>Authorized</b> <code>{user_id}</code>"
         + (f" ({escape(first_name or username or '')})" if (first_name or username) else "")
         + " — they can now send files."
     )
@@ -153,10 +164,12 @@ async def cmd_disallow(message: Message, command: CommandObject, db: Database) -
     user_id, _, _ = target
     removed = await db.remove_user(user_id)
     if removed:
-        await message.answer(f"🗑 Revoked access for <code>{user_id}</code>.")
+        await message.answer(f"🗑 <b>Revoked</b> access for <code>{user_id}</code>.")
     else:
-        await message.answer(f"🤔 User <code>{user_id}</code> wasn't in the access list "
-                             "(env-configured users must be removed from ALLOWED_USER_IDS).")
+        await message.answer(
+            f"🤔 User <code>{user_id}</code> wasn't in the access list "
+            "(env-configured users must be removed from ALLOWED_USER_IDS)."
+        )
 
 
 def _target_user(message: Message, command: CommandObject, forward: bool = True):
@@ -184,22 +197,26 @@ async def cmd_config(message: Message, settings: Settings) -> None:
         filters = f"only {', '.join(sorted(settings.allowed_types))}"
     elif settings.blocked_types:
         filters = f"except {', '.join(sorted(settings.blocked_types))}"
+    divider = "─" * 22
     text = (
-        "⚙️ <b>Configuration</b> <i>(read-only — change via .env and restart)</i>\n\n"
-        f"🤖 Mode: <b>{mode}</b>\n"
-        f"📁 Download dir: <code>{escape(settings.download_dir.name)}</code>\n"
-        f"🗂 Template: <code>{escape(settings.file_template)}</code>\n"
-        f"⚡ Workers: <b>{settings.download_concurrency}</b> · "
+        "⚙️ <b>Configuration</b> <i>(read-only — change via .env and restart)</i>\n"
+        f"{divider}\n"
+        f"🤖 Mode · <b>{mode}</b>\n"
+        f"📁 Downloads · <code>{escape(settings.download_dir.name)}</code>\n"
+        f"🗂 Template · <code>{escape(settings.file_template)}</code>\n"
+        "           per-user override: /folder\n"
+        f"⚡ Workers · <b>{settings.download_concurrency}</b> · "
         f"retries {settings.download_retries}\n"
-        f"🚦 Queue cap: {settings.max_queue_size} · "
+        f"🚦 Queue · cap {settings.max_queue_size} · "
         f"throttle {settings.throttle_rate}/{int(settings.throttle_window)}s\n"
-        f"📦 Max file: {human_size(settings.max_file_size)}\n"
-        f"🎚 Types: {filters}\n"
-        f"👑 Admins: {len(settings.admin_ids)} · allowed: {len(settings.allowed_user_ids)} · "
-        f"open access: {'yes' if settings.open_access else 'no'}"
+        f"📦 Max file · <b>{human_size(settings.max_file_size)}</b>\n"
+        f"🎚 Types · {filters}\n"
+        f"👑 Access · {len(settings.admin_ids)} admins · "
+        f"{len(settings.allowed_user_ids)} allowed · "
+        f"open: {'yes' if settings.open_access else 'no'}"
     )
     if settings.api_base:
-        text += f"\n🌐 Custom Bot API: <code>{escape(settings.api_base)}</code>"
+        text += f"\n🌐 Custom Bot API · <code>{escape(settings.api_base)}</code>"
     await message.answer(text)
 
 
@@ -207,26 +224,27 @@ async def cmd_config(message: Message, settings: Settings) -> None:
 async def cmd_pause(message: Message, manager: DownloadManager) -> None:
     manager.pause()
     await message.answer(
-        "⏸ <b>Queue paused</b> — running downloads finish, nothing new starts.\n"
-        "Use /resume to continue."
+        "⏸ <b>Paused</b> — running downloads finish, nothing new starts.\nResume with /resume."
     )
 
 
 @router.message(Command("resume"))
 async def cmd_resume(message: Message, manager: DownloadManager) -> None:
     manager.resume()
-    await message.answer("▶️ <b>Queue resumed</b>.")
+    await message.answer("▶️ <b>Resumed</b> — the queue picks up where it left off.")
 
 
 @router.message(Command("health"))
 async def cmd_health(message: Message, manager: DownloadManager) -> None:
     """Same info as the HTTP /healthz endpoint, delivered in-chat."""
     snapshot = manager.snapshot()
+    divider = "─" * 22
     text = (
         "❤️ <b>Health</b>\n"
-        f"• Workers: {snapshot.workers_busy}/{snapshot.workers_total} busy\n"
-        f"• Active: {len(snapshot.active)} · Pending: {len(snapshot.pending)}\n"
-        f"• Session: {snapshot.completed} done · {snapshot.failed} failed\n"
-        f"• State: {'PAUSED' if snapshot.paused else 'running'}"
+        f"{divider}\n"
+        f"Workers · <b>{snapshot.workers_busy}/{snapshot.workers_total}</b> busy\n"
+        f"Active · <b>{len(snapshot.active)}</b> · Pending · <b>{len(snapshot.pending)}</b>\n"
+        f"Session · {snapshot.completed} done · {snapshot.failed} failed\n"
+        f"State · <b>{'PAUSED' if snapshot.paused else 'running'}</b>"
     )
     await message.answer(text)
