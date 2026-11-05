@@ -178,7 +178,7 @@ Everything is env-driven (`.env` file supported); human-friendly values like
 | `DOWNLOAD_TIMEOUT` | `900` | per-file hard timeout (seconds, cloud transfer) |
 | `GETFILE_TIMEOUT` | `1800` | how long `getFile` may wait while the local server fetches a big file (seconds) |
 | `PREFETCH` | `true` | start fetching queued files on the local server immediately (local mode) |
-| `PREFETCH_SLOTS` | `6` | max simultaneous server-side fetches (0 disables) |
+| `FETCH_CONCURRENCY` | `2` | max files the local server downloads from Telegram at once — workers **and** prefetch share these slots (1–8; low is right, see *Speeding up big-file downloads*) |
 | `FETCH_WATCH_INTERVAL` | `1.5` | seconds between fetch-progress volume scans |
 | `CHUNK_SIZE` | `256KB` | streaming chunk size |
 | `MAX_FILE_SIZE` | `20MB` | reject bigger files (≤ 20MB cloud · ≤ 4000MB with a local Bot API server) |
@@ -189,7 +189,7 @@ Everything is env-driven (`.env` file supported); human-friendly values like
 | `ALLOWED_TYPES` | *(all)* | only accept these media types |
 | `BLOCKED_TYPES` | *(none)* | never accept these media types |
 | `PROGRESS_MIN_BYTES` | `2MB` | live progress message threshold |
-| `PROGRESS_EDIT_INTERVAL` | `2.0` | seconds between progress edits |
+| `PROGRESS_EDIT_INTERVAL` | `2.0` | seconds between edits of one progress message (edits are also paced globally, so a busy queue cannot flood the chat) |
 | `POLLING_MODE` | `true` | `false` (or set `WEBHOOK_URL`) for webhook |
 | `WEBHOOK_URL` | *(empty)* | e.g. `https://host/tellybee/webhook` (auto-switches mode) |
 | `WEBHOOK_SECRET` | *(empty)* | secret token Telegram echoes back |
@@ -321,20 +321,28 @@ Notes:
 
 ### 🏎 Speeding up big-file downloads
 
-Three layers, all free:
+Four layers, all free:
 
 1. **Prefetching (on by default).** The slow part of local mode is the
    server downloading from Telegram — normally that only starts when a
    worker picks the job. TellyBee instead asks the local server to start
-   fetching every queued file immediately (`PREFETCH=true`, up to
-   `PREFETCH_SLOTS=6` at once), so the server keeps downloading while
-   workers copy finished files. Batches that span different Telegram DCs
-   genuinely parallelize (each DC has its own pool); a batch on one DC
-   finishes in roughly the same total time but stays pipelined.
-2. **Your host's link and disk.** The fetch runs at whatever the ARM box's
+   fetching every queued file immediately (`PREFETCH=true`), so the server
+   keeps downloading while workers copy finished files. Batches that span
+   different Telegram DCs genuinely parallelize (each DC has its own pool);
+   a batch on one DC finishes in roughly the same total time but stays
+   pipelined.
+2. **Bounded fetch concurrency (`FETCH_CONCURRENCY`, default 2).** *Every*
+   server-side fetch — from workers or prefetch — takes one of these
+   shared slots. TDLib keeps only ~2 MiB of a file in flight per Telegram
+   DC, so parallel big-file fetches just split that window between them:
+   with the v0.3.2 defaults a fully busy queue ran **nine** fetches at once
+   and every one crawled at ~0–200 B/s while the bot looked stuck. Two at a
+   time (one on weak hosts) finish fast and keep the pipeline moving; raise
+   it only if your link demonstrably sustains more.
+3. **Your host's link and disk.** The fetch runs at whatever the ARM box's
    internet connection allows, and the `botapi-data` volume must keep up
    with writes — an SD card can throttle a Pi-class host; USB SSDs help.
-3. **The optional `botapi-fast` build (biggest single-file win).** TDLib
+4. **The optional `botapi-fast` build (biggest single-file win).** TDLib
    keeps only **~2 MiB of one file in flight per Telegram DC**
    (`max_download_resource_limit_ = 1 << 21` in TDLib's
    `FileDownloadManager.h`) — on a high-latency link that alone caps a
@@ -426,7 +434,9 @@ before contributing (humans and AI assistants alike).
 | Link download fails with *“the server answered HTTP 404/403…”* | The server rejected the request (expired signed URL, auth required, gone). Nothing retryable — fetch a fresh link. |
 | Link download fails with *“rate-limited”* / `429` | The file host is throttling (seen with seedr-style CDNs on busy free accounts). TellyBee already waits out `Retry-After` and falls back to a single connection; if it still fails, wait a few minutes and re-send the link, or set `LINK_CONNECTIONS=1` for single-stream transfers. |
 | Progress message stuck at “Telegram is preparing…” with no % | The volume watcher could not match a growing file in the server's storage (e.g. the job's size is unknown). Display-only — the download itself is unaffected. |
-| Big files download slowly | See *Speeding up big-file downloads* — prefetching is on by default; the `botapi-fast` build multiplies single-file speed; check the host's link/disk. |
+| With the queue full, every download crawls at ~0 B/s and the bot feels stuck | Too many simultaneous server-side fetches split TDLib's ~2 MiB per-DC window between them (v0.3.2 ran up to 9 at once). Update to ≥ 0.3.3 — workers and prefetch now share the `FETCH_CONCURRENCY` slots (default 2); on weak links set `FETCH_CONCURRENCY=1`. |
+| Receipts arrive late or some never showed up (v0.3.2) | A busy queue's progress-message edits exceeded what Telegram allows per chat — the flood-waits swallowed receipt edits whole. Update to ≥ 0.3.3: edits are paced globally and receipts are retried / re-sent, never dropped. |
+| Big files download slowly | See *Speeding up big-file downloads* — prefetching is on by default and fetch concurrency is capped sensibly; the `botapi-fast` build multiplies single-file speed; check the host's link/disk. |
 | `…exceeds 4.0 GB limit` on intake | Telegram's absolute per-file maximum (Premium uploads cap at 4 GB) — nothing larger exists to download. Use a direct link instead. |
 | Queue full rejections | Raise `MAX_QUEUE_SIZE` and/or `DOWNLOAD_CONCURRENCY`. |
 | Healthcheck failing | `curl http://localhost:8080/healthz` — if the bot is crash-looping, check `docker compose logs`. |

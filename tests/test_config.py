@@ -200,18 +200,27 @@ def test_getfile_timeout_bounds():
 def test_prefetch_settings_defaults_and_bounds():
     s = Settings(bot_token=VALID_TOKEN)
     assert s.prefetch is True
-    assert s.prefetch_slots == 6
+    assert s.fetch_concurrency == 2
     assert s.fetch_watch_interval == 1.5
 
-    with pytest.raises(ValidationError, match="PREFETCH_SLOTS"):
-        Settings(bot_token=VALID_TOKEN, prefetch_slots=99)
+    with pytest.raises(ValidationError, match="FETCH_CONCURRENCY"):
+        Settings(bot_token=VALID_TOKEN, fetch_concurrency=0)
+    with pytest.raises(ValidationError, match="FETCH_CONCURRENCY"):
+        Settings(bot_token=VALID_TOKEN, fetch_concurrency=9)
     with pytest.raises(ValidationError, match="FETCH_WATCH_INTERVAL"):
         Settings(bot_token=VALID_TOKEN, fetch_watch_interval=0.05)
 
 
-def test_prefetch_slots_zero_disables():
-    s = Settings(bot_token=VALID_TOKEN, prefetch_slots=0)
-    assert s.prefetch_slots == 0
+def test_stale_prefetch_slots_env_is_ignored(monkeypatch):
+    """PREFETCH_SLOTS (v0.3.2) became FETCH_CONCURRENCY (0.3.3).
+
+    A leftover line in an existing .env must not crash startup — unknown
+    env vars are ignored by design.
+    """
+    monkeypatch.setenv("PREFETCH_SLOTS", "6")
+    s = Settings(bot_token=VALID_TOKEN)
+    assert s.prefetch is True
+    assert s.fetch_concurrency == 2
 
 
 def test_link_settings_defaults_and_bounds():
@@ -245,6 +254,7 @@ def test_link_max_size_accepts_human_and_blank():
 def test_summary_reports_new_toggles():
     s = Settings(bot_token=VALID_TOKEN)
     assert "prefetch=True" in s.summary()
+    assert "fetches=2" in s.summary()
     assert "links=True" in s.summary()
     off = Settings(bot_token=VALID_TOKEN, prefetch=False, links_enabled=False)
     assert "prefetch=False" in off.summary()

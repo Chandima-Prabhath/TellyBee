@@ -78,6 +78,16 @@ class DownloadJob:
     fetch_done: int | None = None
     fetch_total: int | None = None
     fetch_speed: float = 0.0
+    #: Average network speed of the server-side fetch (bytes/s), captured when
+    #: the getFile wait ends. Used by receipts so a file that was prefetched
+    #: while queued reports its real Telegram speed instead of the (absurd)
+    #: disk-copy speed the worker measures afterwards.
+    fetch_bps: float | None = None
+    #: True when the file was already fully fetched before a worker picked the
+    #: job up (prefetch finished, or a recent copy left it in the path cache) —
+    #: the worker then only stream-copies it locally, which takes under a
+    #: second and must not be presented as a "download speed".
+    fetched_ahead: bool = False
     #: Watcher-internal sticky candidate path (inside the server's storage,
     #: contains the bot token — NEVER log or send it anywhere).
     fetch_path: str | None = None

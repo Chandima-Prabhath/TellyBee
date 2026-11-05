@@ -32,9 +32,16 @@ Local-mode performance pipeline (v0.3+):
 * **Prefetch** — the *slow* part of local mode is the server-side download
   from Telegram (``getFile`` blocks until TDLib has fetched the whole
   file; TDLib keeps only ~2 MiB of a file in flight per Telegram DC).
-  Queued jobs therefore trigger their ``getFile`` immediately through a
-  bounded prefetch pool instead of waiting for a worker slot, so the
-  server downloads ahead while workers copy finished files.
+  Queued jobs therefore trigger their ``getFile`` immediately instead of
+  waiting for a worker slot, so the server downloads ahead while workers
+  copy finished files.
+* **Bounded fetch concurrency** — *every* server-side fetch (worker- or
+  prefetch-driven) shares the ``FETCH_CONCURRENCY`` slots. TDLib's ~2 MiB
+  in-flight window per DC is the real bottleneck: letting 3 workers + 6
+  prefetch slots fetch big files simultaneously (the v0.3.2 defaults)
+  split that window nine ways and every fetch crawled at ~0–200 B/s,
+  stalling the whole queue — one or two fetches at a time finish fast and
+  keep the pipeline busy instead.
 * **Fetch progress** — while ``getFile`` is parked, a watcher polls the
   server's shared storage for growing files and maps them to waiting jobs
   by expected size, so the chat shows real % / speed / ETA during the
@@ -148,14 +155,23 @@ class DownloadEngine:
         # ── local-mode fetch pipeline state ─────────────────────────────
         # file_id → the ONE shared getFile task (many jobs may await it)
         self._inflight: dict[str, asyncio.Task] = {}
+        # file_id → monotonic time when that task's getFile loop actually
+        # began (after the fetch semaphore granted a slot). Lets a
+        # prefetch-driven wait tell "queued behind other fetches" apart
+        # from "fetching right now", and keeps waiting_since honest (the
+        # true fetch start, not the moment a late waiter joined).
+        self._fetch_started: dict[str, float] = {}
         # job_id → job while it waits for the server-side fetch (watcher input)
         self._watching: dict[str, DownloadJob] = {}
         # job_id → (last observed server-side size, monotonic time), for speed
         self._fetch_prev: dict[str, tuple[int, float]] = {}
         self._watcher_task: asyncio.Task | None = None
-        self._prefetch_sem: asyncio.Semaphore | None = (
-            asyncio.Semaphore(settings.prefetch_slots)
-            if settings.prefetch and settings.prefetch_slots > 0
+        # ONE bound for ALL concurrent server-side fetches — workers and
+        # prefetch take slots from the same semaphore. Cloud mode needs no
+        # bound (getFile there is a quick metadata call).
+        self._fetch_sem: asyncio.Semaphore | None = (
+            asyncio.Semaphore(settings.fetch_concurrency)
+            if self._local_mode
             else None
         )
         self._url = UrlDownloader(settings) if settings.links_enabled else None
@@ -231,7 +247,8 @@ class DownloadEngine:
         return text
 
     async def resolve_file_path(
-        self, file_id: str, job: DownloadJob | None = None
+        self, file_id: str, job: DownloadJob | None = None,
+        from_prefetch: bool = False,
     ) -> str:
         """getFile with caching; retryable wrapper handles network hiccups.
 
@@ -247,7 +264,12 @@ class DownloadEngine:
 
         All callers for the same ``file_id`` share ONE underlying getFile
         task (prefetcher and workers), so a file is only ever asked for
-        once at a time.
+        once at a time. In local mode every such task holds one of the
+        ``FETCH_CONCURRENCY`` fetch slots for its whole server-side
+        download; ``from_prefetch=True`` waits to register display state
+        until the fetch actually begins, so a deep queue of prefetched
+        files does not spawn a wall of "preparing…" messages for fetches
+        that are merely queued behind others.
         """
         cached = self._cache.get(file_id)
         if cached:
@@ -260,20 +282,26 @@ class DownloadEngine:
                 job.job_id if job else file_id[:12],
                 round(self._settings.getfile_timeout),
             )
+        task = await self._fetch_task(file_id)
         if job is not None:
-            job.waiting_since = time.monotonic()
-            self._watching[job.job_id] = job
-            self._ensure_watcher()
+            if from_prefetch:
+                # Parked behind other fetches? Stay invisible (plain
+                # "waiting in queue") until our turn actually comes.
+                # Deliberate polling (not an Event): it must also wake for
+                # /cancel on a queued job within a second, not whenever the
+                # fetch finally starts.
+                while (  # noqa: ASYNC110 — poll keeps /cancel responsive
+                    file_id not in self._fetch_started
+                    and not task.done()
+                    and not job.is_cancelled()
+                ):
+                    await asyncio.sleep(_GETFILE_CANCEL_POLL)
+            self._begin_fetch_wait(job, self._fetch_started.get(file_id))
         try:
-            file = await self._race_cancel(await self._fetch_task(file_id), job)
+            file = await self._race_cancel(task, job)
         finally:
             if job is not None:
-                job.waiting_since = None
-                self._watching.pop(job.job_id, None)
-                self._fetch_prev.pop(job.job_id, None)
-                job.fetch_done = None
-                job.fetch_total = None
-                job.fetch_speed = 0.0
+                self._end_fetch_wait(job)
         path = file.file_path
         if not path:
             raise DownloadError("getFile returned an empty file_path")
@@ -316,44 +344,58 @@ class DownloadEngine:
         out just ask again — the server attaches the new query to the SAME
         in-flight download and answers it on completion.
 
+        In local mode the whole wait holds one ``FETCH_CONCURRENCY`` slot:
+        the server-side fetch IS the scarce resource, and workers must
+        compete for the same slots as prefetch instead of piling on top of
+        them (that pile-up is what made busy queues crawl at ~0 B/s).
+
         The task is deliberately never cancelled from the outside: waiters
         race their own cancel events around it (see ``_race_cancel``), so one
         waiter bailing out never kills the fetch for the others. Successful
         results are cached here so every future waiter is instant.
         """
-        deadline = (
-            time.monotonic() + _GETFILE_TOTAL_BUDGET if self._local_mode else None
-        )
-        attempt = 0
-        while True:
-            request_timeout = (
-                round(self._settings.getfile_timeout) if self._local_mode else None
+        sem = self._fetch_sem
+        if sem is not None:
+            await sem.acquire()
+        try:
+            self._fetch_started[file_id] = time.monotonic()
+            deadline = (
+                time.monotonic() + _GETFILE_TOTAL_BUDGET if self._local_mode else None
             )
-            try:
-                file = await self._bot.get_file(
-                    file_id, request_timeout=request_timeout
+            attempt = 0
+            while True:
+                request_timeout = (
+                    round(self._settings.getfile_timeout) if self._local_mode else None
                 )
-            except TelegramNetworkError as err:
-                timed_out = "timeout" in str(err).lower()
-                if (
-                    deadline is None
-                    or not timed_out
-                    or time.monotonic() >= deadline
-                ):
-                    raise  # real error, cloud mode, or out of budget → retries
-                attempt += 1
-                logger.info(
-                    "the local Bot API server is still fetching file %s "
-                    "(getFile timed out client-side after %ss, wait #%d) — asking "
-                    "again; the server keeps its download progress",
-                    file_id[:12],
-                    round(self._settings.getfile_timeout),
-                    attempt,
-                )
-            else:
-                if file.file_path:
-                    self._cache.put(file_id, file.file_path)
-                return file
+                try:
+                    file = await self._bot.get_file(
+                        file_id, request_timeout=request_timeout
+                    )
+                except TelegramNetworkError as err:
+                    timed_out = "timeout" in str(err).lower()
+                    if (
+                        deadline is None
+                        or not timed_out
+                        or time.monotonic() >= deadline
+                    ):
+                        raise  # real error, cloud mode, or out of budget → retries
+                    attempt += 1
+                    logger.info(
+                        "the local Bot API server is still fetching file %s "
+                        "(getFile timed out client-side after %ss, wait #%d) — asking "
+                        "again; the server keeps its download progress",
+                        file_id[:12],
+                        round(self._settings.getfile_timeout),
+                        attempt,
+                    )
+                else:
+                    if file.file_path:
+                        self._cache.put(file_id, file.file_path)
+                    return file
+        finally:
+            if sem is not None:
+                sem.release()
+            self._fetch_started.pop(file_id, None)
 
     async def _race_cancel(
         self, task: asyncio.Task, job: DownloadJob | None
@@ -374,6 +416,39 @@ class DownloadEngine:
                 return task.result()
         raise JobCancelled(job.job_id)
 
+    # ── fetch-wait bookkeeping (local mode) ─────────────────────────────────
+
+    def _begin_fetch_wait(self, job: DownloadJob, since: float | None) -> None:
+        """Mark a job as waiting on the server-side fetch (watcher input).
+
+        ``since`` is the fetch's true start time when known (the fetch may
+        have begun while the job was still queued), so speed stats measure
+        the whole fetch, not just the tail a late waiter observed.
+        """
+        job.waiting_since = since if since is not None else time.monotonic()
+        self._watching[job.job_id] = job
+        self._ensure_watcher()
+
+    def _end_fetch_wait(self, job: DownloadJob) -> None:
+        """Clear the wait state, capturing honest stats for the receipt.
+
+        ``fetch_bps`` is the server-side fetch's real average speed. The
+        receipt needs it for files that finished fetching while still queued
+        (the worker then only copies the file locally in under a second,
+        which must never be presented as a "download speed").
+        """
+        if job.waiting_since is not None:
+            waited = time.monotonic() - job.waiting_since
+            total = job.fetch_total or job.file_size
+            if total and waited > 0:
+                job.fetch_bps = total / waited
+        job.waiting_since = None
+        self._watching.pop(job.job_id, None)
+        self._fetch_prev.pop(job.job_id, None)
+        job.fetch_done = None
+        job.fetch_total = None
+        job.fetch_speed = 0.0
+
     # ── prefetch (local mode) ──────────────────────────────────────────────
 
     async def prefetch(self, job: DownloadJob) -> None:
@@ -383,39 +458,44 @@ class DownloadEngine:
         only trigger it when they pick a job — with a queue of N big files
         the server would otherwise idle between worker slots. Prefetching
         keeps the local Bot API server busy while workers copy whatever is
-        already finished. Bounded by ``PREFETCH_SLOTS``; failures are logged
-        and left to the worker's retry machinery.
+        already finished. Concurrency is bounded globally by
+        ``FETCH_CONCURRENCY`` — the very same slots workers take, so
+        prefetching can never pile extra simultaneous fetches on top of a
+        fully busy queue (that pile-up is what used to crawl at ~0 B/s).
+        Failures are logged and left to the worker's retry machinery.
 
         Pausing the queue does NOT pause prefetch: the server-side cache
         filling up is harmless and makes /resume instant.
         """
-        if self._prefetch_sem is None or not self._local_mode:
+        if not self._local_mode or not self._settings.prefetch:
             return
         if self._cache.get(job.file_id):
             return
-        async with self._prefetch_sem:
-            if (
-                job.is_cancelled()
-                or job.status not in (JobStatus.QUEUED, JobStatus.RUNNING)
-                or self._cache.get(job.file_id)
-            ):
-                return
+        if (
+            job.is_cancelled()
+            or job.status not in (JobStatus.QUEUED, JobStatus.RUNNING)
+        ):
+            return
+        logger.info(
+            "prefetch: asking the local Bot API server to start fetching "
+            "job #%s (%s) ahead of time",
+            job.job_id, job.rel_path,
+        )
+        try:
+            await self.resolve_file_path(job.file_id, job=job, from_prefetch=True)
+        except JobCancelled:
+            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001 — the worker retries properly
             logger.info(
-                "prefetch: asking the local Bot API server to start fetching "
-                "job #%s (%s) ahead of time",
-                job.job_id, job.rel_path,
+                "prefetch for job #%s gave up (%s: %s) — the worker will retry",
+                job.job_id, type(err).__name__, self._redact(str(err)),
             )
-            try:
-                await self.resolve_file_path(job.file_id, job=job)
-            except JobCancelled:
-                pass
-            except asyncio.CancelledError:
-                raise
-            except Exception as err:  # noqa: BLE001 — the worker retries properly
-                logger.info(
-                    "prefetch for job #%s gave up (%s: %s) — the worker will retry",
-                    job.job_id, type(err).__name__, self._redact(str(err)),
-                )
+        else:
+            # Fetched before any worker needed it — the receipt will show
+            # the Telegram fetch speed instead of the instant local copy.
+            job.fetched_ahead = True
 
     # ── fetch-progress watcher (local mode) ─────────────────────────────────
 
@@ -594,6 +674,12 @@ class DownloadEngine:
             except UrlRejected as err:
                 # Non-retryable (bad URL, HTTP 4xx, size cap, SSRF block…).
                 raise DownloadError(str(err)) from err
+        # A cache hit means the server already holds this file (prefetch
+        # finished while the job was queued, or an earlier job fetched it
+        # within the cache TTL): the worker will only stream-copy it — flag
+        # that so the receipt reports the real network speed instead of a
+        # meaningless "250 MB/s" disk-copy figure.
+        job.fetched_ahead = self._cache.get(job.file_id) is not None
         file_path = await self.resolve_file_path(job.file_id, job=job)
         if self._local_mode and file_path.startswith("/"):
             # Local Bot API server: getFile returns an absolute path inside
@@ -765,6 +851,11 @@ class DownloadEngine:
     ) -> EngineResult:
         duration_ms = int((time.monotonic() - started) * 1000)
         avg_speed = bytes_written / (duration_ms / 1000) if duration_ms else 0.0
+        if job.fetched_ahead and job.fetch_bps:
+            # The "transfer" was a local disk handoff of an already-fetched
+            # file — the number users care about is the Telegram fetch
+            # speed, not how fast the volume was copied.
+            avg_speed = job.fetch_bps
         job.sha256 = digest.hexdigest()
         job.bytes_done = bytes_written
         job.duration_ms = duration_ms

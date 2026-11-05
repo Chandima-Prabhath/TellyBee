@@ -2,7 +2,12 @@
 
 Pins down the v0.3 local-mode performance contract:
 * one shared getFile task per file_id (prefetcher + workers join it),
+* ALL server-side fetches — worker- and prefetch-driven — share the
+  FETCH_CONCURRENCY slots (v0.3.3: the v0.3.2 defaults let 3 workers +
+  6 prefetch slots fetch at once and every fetch crawled at ~0 B/s),
 * prefetch fills the path cache and skips cancelled/finished jobs,
+* a prefetch-driven wait stays invisible (no "preparing" progress message)
+  while its fetch is still parked behind the semaphore,
 * the manager schedules a prefetch task per submit and cancels them on
   shutdown, and tripping a pending job's cancel event aborts its prefetch,
 * the volume watcher maps growing files in the server's storage to waiting
@@ -48,7 +53,6 @@ class _FakeBot:
         self._file = file
         self._delay = delay
         self.calls: list[dict] = []
-
     async def get_file(self, file_id: str, request_timeout: int | None = None) -> File:
         self.calls.append({"file_id": file_id, "request_timeout": request_timeout})
         if self._delay:
@@ -79,7 +83,6 @@ def _local_settings(settings) -> Settings:
         download_dir=settings.download_dir,
         db_path=settings.db_path,
         prefetch=True,
-        prefetch_slots=4,
         fetch_watch_interval=0.2,  # validation floor; fast enough for tests
     )
 
@@ -142,19 +145,18 @@ async def test_prefetch_fills_cache(settings, tmp_path):
 
 
 async def test_prefetch_disabled_or_cloud_is_a_noop(settings, tmp_path):
-    for kwargs in ({"prefetch": False}, {"prefetch_slots": 0}):
-        tuned = Settings(
-            bot_token=VALID_TOKEN,
-            download_dir=settings.download_dir,
-            db_path=settings.db_path,
-            **kwargs,
-        )
-        bot = _FakeBot(is_local=True, file=File(file_id="f", file_unique_id="u",
-                                                file_size=10, file_path="p"))
-        engine = DownloadEngine(bot, tuned)
-        await engine.prefetch(_job(tmp_path))
-        assert bot.calls == []
-        await engine.aclose()
+    tuned = Settings(
+        bot_token=VALID_TOKEN,
+        download_dir=settings.download_dir,
+        db_path=settings.db_path,
+        prefetch=False,
+    )
+    bot = _FakeBot(is_local=True, file=File(file_id="f", file_unique_id="u",
+                                            file_size=10, file_path="p"))
+    engine = DownloadEngine(bot, tuned)
+    await engine.prefetch(_job(tmp_path))
+    assert bot.calls == []
+    await engine.aclose()
 
     # cloud mode: getFile is a quick metadata call — prefetch must no-op
     bot = _FakeBot(is_local=False, file=File(file_id="f", file_unique_id="u",
@@ -193,6 +195,126 @@ async def test_prefetch_skips_terminal_jobs(settings, tmp_path):
     await engine.prefetch(job)
     assert bot.calls == []
     await engine.aclose()
+
+
+# ── fetch concurrency: ONE bound for workers and prefetch (0.3.3) ──────────
+
+
+class _ConcurrencyBot(_FakeBot):
+    """getFile that tracks how many calls are in flight at once."""
+
+    def __init__(self, file: File, delay: float, is_local: bool = True) -> None:
+        super().__init__(is_local=is_local, file=file, delay=delay)
+        self.inflight = 0
+        self.max_inflight = 0
+
+    async def get_file(self, file_id: str, request_timeout: int | None = None) -> File:
+        self.calls.append({"file_id": file_id, "request_timeout": request_timeout})
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        try:
+            await asyncio.sleep(self._delay)
+            return File(file_id=file_id, file_unique_id="u", file_size=10,
+                        file_path=f"documents/{file_id}")
+        finally:
+            self.inflight -= 1
+
+
+async def test_fetch_semaphore_bounds_concurrent_getfile(settings):
+    """Workers and prefetch share the FETCH_CONCURRENCY slots.
+
+    Regression (v0.3.2): a fully busy queue fetched 3 (workers) + 6
+    (prefetch slots) big files at once; TDLib's ~2 MiB per-DC window split
+    nine ways and every fetch crawled at ~0 B/s.
+    """
+    tuned = Settings(
+        bot_token=VALID_TOKEN,
+        download_dir=settings.download_dir,
+        db_path=settings.db_path,
+        fetch_concurrency=2,
+    )
+    bot = _ConcurrencyBot(file=None, delay=0.15, is_local=True)  # type: ignore[arg-type]
+    engine = DownloadEngine(bot, tuned)
+
+    results = await asyncio.gather(
+        *(engine.resolve_file_path(f"file-{i}") for i in range(5))
+    )
+    assert len(results) == 5
+    assert len(bot.calls) == 5
+    assert bot.max_inflight == 2  # never more than FETCH_CONCURRENCY
+    await engine.aclose()
+
+
+async def test_parked_prefetch_stays_invisible(settings, tmp_path):
+    """A prefetch whose fetch is queued behind others shows no progress UI.
+
+    With the semaphore inside the fetch task, a parked prefetch must not set
+    waiting_since — otherwise a 35-file queue would spawn 35 "Telegram is
+    preparing…" messages for fetches that have not even started.
+    """
+    tuned = Settings(
+        bot_token=VALID_TOKEN,
+        download_dir=settings.download_dir,
+        db_path=settings.db_path,
+        fetch_concurrency=1,
+        fetch_watch_interval=0.2,
+    )
+    bot = _ConcurrencyBot(file=None, delay=0.6, is_local=True)  # type: ignore[arg-type]
+    engine = DownloadEngine(bot, tuned)
+
+    first = asyncio.create_task(engine.resolve_file_path("file-a"))
+    await asyncio.sleep(0.15)  # first fetch holds the only slot
+
+    job_b = _job(tmp_path, "b.mkv", size=100)
+    job_b.status = JobStatus.QUEUED
+    parked = asyncio.create_task(engine.prefetch(job_b))
+    await asyncio.sleep(0.15)  # prefetch parked on the semaphore
+    assert job_b.waiting_since is None, "parked prefetch must stay invisible"
+    assert job_b.fetch_done is None
+
+    await asyncio.wait_for(parked, timeout=5.0)
+    await asyncio.wait_for(first, timeout=5.0)
+    # once its turn came, the fetch ran and the job is marked fetched-ahead
+    assert job_b.fetched_ahead is True
+    await engine.aclose()
+
+
+async def test_prefetch_records_network_speed(settings, tmp_path):
+    """Prefetched jobs keep their real fetch speed for honest receipts."""
+    settings = _local_settings(settings)
+    bot = _FakeBot(is_local=True, file=File(file_id="f", file_unique_id="u", file_size=10,
+                                            file_path="documents/file_0"), delay=0.2)
+    engine = DownloadEngine(bot, settings)
+    job = _job(tmp_path, "movie.mkv", size=800_000_000)
+    job.status = JobStatus.QUEUED
+
+    await engine.prefetch(job)
+
+    assert job.fetched_ahead is True
+    # fetch_bps is derived from the real wait (file_size / waited), so it
+    # stays in the network-speed range — nothing like the ~250 MB/s local
+    # disk-copy figure the worker's own timing would report
+    assert job.fetch_bps is not None
+    assert job.fetch_bps > 400_000_000  # the 0.2 s fake wait → ~GB/s range
+    await engine.aclose()
+
+
+def test_finish_reports_network_speed_for_prefetched_jobs(tmp_path):
+    """_finish prefers the Telegram fetch speed over the copy speed."""
+    import hashlib
+    import time
+
+    job = _job(tmp_path, "ready.mkv", size=126_000_000)
+    job.fetched_ahead = True
+    job.fetch_bps = 420_000.0
+
+    result = DownloadEngine._finish(
+        job, started=time.monotonic(), digest=hashlib.sha256(),
+        bytes_written=126_000_000,
+    )
+    # the disk copy took ~0.5 s (≈ 250 MB/s) — the receipt must NOT use it
+    assert result.avg_speed == pytest.approx(420_000.0)
+    assert job.avg_speed == pytest.approx(420_000.0)
 
 
 # ── manager wiring ──────────────────────────────────────────────────────────

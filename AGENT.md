@@ -114,15 +114,31 @@ workflow data is injected by parameter name — handlers declare
   chunk boundary (or the next 1s poll while parked in `getFile`) and raises
   `JobCancelled`.
 - `submit()` also schedules a **prefetch task** (`engine.prefetch(job)`, local
-  mode only, semaphore-bounded by `PREFETCH_SLOTS`) — the task races the
-  job's cancel event and is cancelled wholesale at shutdown, BEFORE the
-  workers drain, so the server stops being asked for new files first.
+  mode only) — the task races the job's cancel event and is cancelled
+  wholesale at shutdown, BEFORE the workers drain, so the server stops being
+  asked for new files first. Prefetch itself no longer owns a semaphore:
+  the fetch task's `_fetch_with_reissue` body acquires the engine's ONE
+  `FETCH_CONCURRENCY` semaphore, so workers' fetches and prefetch compete
+  for the same slots (v0.3.2 let 3 workers + 6 prefetch slots fetch at once
+  and every fetch crawled at ~0 B/s). A prefetch whose fetch is still
+  parked on the semaphore leaves `waiting_since` unset — no "preparing"
+  message, no fetch progress — until its turn actually comes.
 - The notifier groups jobs by `album_key or f"job:{job_id}"`; a group owns
   at most one chat message, created lazily only when
   `expected_bytes >= PROGRESS_MIN_BYTES` **and a job is running or fetching
   (waiting in `getFile` — with prefetch that happens while still QUEUED)**,
-  edited at most once per `PROGRESS_EDIT_INTERVAL`, finalized into exactly
-  one receipt.
+  edited at most once per `PROGRESS_EDIT_INTERVAL` **plus a global edit
+  pacer (one edit in flight, ~1/s across ALL groups — routine refreshes are
+  dropped, never queued)**, finalized into exactly one receipt. Receipt
+  edits are `urgent`: they bypass the drop rule, wait out one
+  `TelegramRetryAfter` (bounded), and fall back to sending a fresh message
+  — a completed download must never end up without its receipt.
+- Honest receipt speeds (v0.3.3): when a job's server-side fetch finished
+  before a worker picked it up (`fetched_ahead`, set by `prefetch()` on
+  success or by the `_attempt` cache-hit check), `_finish` reports
+  `job.fetch_bps` (fetch_total / waited, captured in `_end_fetch_wait`) as
+  `avg_speed` instead of the instant disk-copy rate, and the receipt says
+  "fetched ahead … copy was instant" — never a misleading "250 MB/s".
 
 ## Adding things (checklists)
 
@@ -263,6 +279,33 @@ models — see `tests/test_media_types.py` for the pattern.
   burst that per-second limiters refuse (real seedr case, v0.3.2). HTTP 429
   arrives as a normal response, NOT an exception — check
   `_is_rate_limit_status` after `session.get`, before reading the body.
+- **TDLib's ~2 MiB in-flight window per DC is shared by ALL simultaneous
+  downloads** — N concurrent server-side fetches each get ~1/N of it. The
+  v0.3.2 defaults (3 workers + `PREFETCH_SLOTS=6`) let a busy queue run
+  nine fetches at once and every one crawled at ~0–200 B/s while the bot
+  looked stuck (real 35-episode batch case). Since 0.3.3 the ONE
+  `FETCH_CONCURRENCY` semaphore (default 2) is acquired by the shared
+  fetch task's body (`_fetch_with_reissue`) — workers' getFile waits and
+  prefetch compete for the same slots; prefetch() itself is unbounded
+  because its parked fetch tasks hold nothing.
+- **Telegram tolerates ~1 message edit per second per chat sustained.**
+  Per-group throttling alone under-counts: N live progress messages × 1
+  edit / `PROGRESS_EDIT_INTERVAL` is N× the budget → 429 flood-waits → the
+  old code DROPPED the failing edit, and for a receipt that meant the
+  receipt vanished silently ("bot updates stuck"). Since 0.3.3 routine
+  refreshes are droppable (skipped when an edit is in flight or the 1s
+  global gap hasn't elapsed — never queued), while receipts are `urgent`:
+  they wait their turn, retry once after a bounded `Retry-After`, and fall
+  back to sending a fresh message.
+- **A prefetched file's receipt must not show its disk-copy speed.** When
+  the server-side fetch finished while the job was still queued, the
+  worker only stream-copies locally (<1 s) — `avg_speed` then reports
+  ~250 MB/s of volume speed and users read it as a lie. Track
+  `fetched_ahead` (prefetch success, or the `_attempt` cache-hit check)
+  plus `fetch_bps` (`fetch_total / waited`, captured in `_end_fetch_wait`
+  from the fetch's TRUE start time) and prefer them in `_finish` and the
+  receipt ("⚡ … from Telegram — fetched ahead of the queue, copy was
+  instant").
 - **The 2GB figure is an UPLOAD cap, not a download cap.** Verified against
   10.3 sources: `MAX_DOWNLOAD_FILE_SIZE = 20MB` and BOTH download-size
   checks are guarded by `!parameters_->local_mode_` — in local mode the

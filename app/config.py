@@ -162,8 +162,13 @@ class Settings(BaseSettings):
     # instead of waiting for a worker slot — the server-side download is the
     # slow part of local mode, so keeping it busy pipelines the queue.
     prefetch: bool = True
-    # How many files may be fetched server-side at once (0 disables).
-    prefetch_slots: int = 6
+    # How many files the local Bot API server may download from Telegram at
+    # once — ONE shared bound for workers and prefetch alike. TDLib keeps
+    # only ~2 MiB of a file in flight per Telegram DC, so simultaneous
+    # fetches split that window and each crawls (a fully busy queue used to
+    # sit at ~0 B/s with nine of them). Keep this low (1–2) unless the
+    # host's link demonstrably sustains more.
+    fetch_concurrency: int = 2
     # How often (seconds) the engine polls the server's shared volume to
     # estimate live fetch progress for waiting jobs.
     fetch_watch_interval: float = 1.5
@@ -315,8 +320,12 @@ class Settings(BaseSettings):
                 "Bot API server can legitimately take minutes to answer getFile "
                 "while it fetches a large file)"
             )
-        if not 0 <= self.prefetch_slots <= 32:
-            raise ValueError("PREFETCH_SLOTS must be between 0 and 32")
+        if not 1 <= self.fetch_concurrency <= 8:
+            raise ValueError(
+                "FETCH_CONCURRENCY must be between 1 and 8 (low is right: the "
+                "local server's Telegram window is the bottleneck, and extra "
+                "parallel fetches only split it)"
+            )
         if not 0.2 <= self.fetch_watch_interval <= 30.0:
             raise ValueError(
                 "FETCH_WATCH_INTERVAL must be between 0.2 and 30 seconds"
@@ -389,6 +398,6 @@ class Settings(BaseSettings):
             f"db={self.db_path} workers={self.download_concurrency} "
             f"admins={len(self.admin_ids)} allowed={len(self.allowed_user_ids)} "
             f"open_access={self.open_access} "
-            f"prefetch={self.prefetch and self.prefetch_slots > 0} "
+            f"prefetch={self.prefetch} fetches={self.fetch_concurrency} "
             f"links={self.links_enabled} ssrf={self.link_ssrf_guard}"
         )

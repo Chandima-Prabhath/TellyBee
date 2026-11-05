@@ -28,6 +28,16 @@ from app.utils.sizes import human_size, human_speed
 
 logger = logging.getLogger(__name__)
 
+#: Minimum seconds between ANY two progress-message edits, across all groups.
+#: Telegram tolerates roughly one edit per second per chat sustained — a busy
+#: queue easily has more live progress messages than that, and unpaced edits
+#: used to turn into a 429 flood-wait storm that froze every message in the
+#: chat ("stuck updates") and swallowed receipts.
+_EDIT_MIN_GAP = 1.0
+#: Upper bound (seconds) for how long a receipt edit/send may sleep on a
+#: Telegram ``Retry-After`` before falling back to another strategy.
+_RECEIPT_MAX_WAIT = 15.0
+
 _TYPE_ICONS = {
     "photo": "🖼",
     "video": "🎬",
@@ -114,6 +124,10 @@ class Notifier:
         self._bot = bot
         self._settings = settings
         self._groups: dict[str, _Group] = {}
+        # Global pacing for message edits (see _EDIT_MIN_GAP): one edit in
+        # flight at a time, routine refreshes dropped rather than queued.
+        self._edit_lock = asyncio.Lock()
+        self._next_edit_at = 0.0
 
     async def aclose(self) -> None:
         for group in list(self._groups.values()):
@@ -162,10 +176,13 @@ class Notifier:
                 await asyncio.sleep(0.4)
                 # Lazily create the message once transfer actually started
                 # (or the server-side fetch — with prefetch a QUEUED job is
-                # already fetching) and the group is big enough to be worth it.
+                # already fetching) and the group is big enough to be worth
+                # it. A send that hit a flood-wait parks the next attempt
+                # beyond the announced window (group._last_edit).
                 if (
                     group.message_id is None
                     and not group.broken
+                    and time.monotonic() >= group._last_edit
                     and (group.any_running or group.any_waiting)
                     and group.expected_bytes >= self._settings.progress_min_bytes
                 ):
@@ -184,7 +201,9 @@ class Notifier:
             )
             group.message_id = message.message_id
         except TelegramRetryAfter as err:
-            await asyncio.sleep(err.retry_after or 1)
+            # No sleeping here (runs under the group lock): park the next
+            # creation attempt beyond the announced window instead.
+            group._last_edit = time.monotonic() + (err.retry_after or 1)
         except Exception as err:  # noqa: BLE001 — chat may be unreachable
             logger.warning("cannot send progress message to chat %s: %s", group.chat_id, err)
             group.broken = True
@@ -196,38 +215,103 @@ class Notifier:
         group._last_edit = now
         await self._edit_message(group, self._progress_text(group))
 
-    async def _edit_message(self, group: _Group, text: str) -> None:
+    async def _edit_message(self, group: _Group, text: str, urgent: bool = False) -> bool:
+        """Edit a group's message, paced globally; returns True if delivered.
+
+        Routine progress refreshes are *droppable*: when another edit is in
+        flight or the global gap has not elapsed, the refresh is simply
+        skipped — the next updater tick retries with fresher numbers. This
+        keeps the total edit rate inside what Telegram tolerates per chat,
+        instead of queueing a backlog that ends in 429 flood-waits.
+
+        Receipt edits (``urgent=True``) wait their turn instead of being
+        dropped and survive a flood-wait: one bounded retry after the
+        announced ``Retry-After``, else the caller falls back to sending
+        the receipt as a fresh message — a completed download must never
+        end up without its receipt.
+        """
         if group.message_id is None or group.broken:
-            return
-        try:
-            await self._bot.edit_message_text(
-                text, chat_id=group.chat_id, message_id=group.message_id
-            )
-        except TelegramBadRequest as err:
-            if "message is not modified" in str(err).lower():
-                return
-            if "message to edit not found" in str(err).lower():
+            return False
+        if not urgent:
+            now = time.monotonic()
+            if self._edit_lock.locked() or now < self._next_edit_at:
+                return False  # droppable refresh — never queue edits up
+        async with self._edit_lock:
+            self._next_edit_at = time.monotonic() + _EDIT_MIN_GAP
+            try:
+                await self._bot.edit_message_text(
+                    text, chat_id=group.chat_id, message_id=group.message_id
+                )
+                return True
+            except TelegramBadRequest as err:
+                if "message is not modified" in str(err).lower():
+                    return True
+                if "message to edit not found" in str(err).lower():
+                    group.broken = True
+                    return False
+                logger.debug("edit failed for group %s: %s", group.key, err)
+                return False
+            except TelegramRetryAfter as err:
+                if not urgent:
+                    # Back off hard: pushing the throttle window past the
+                    # flood wait keeps later edits quiet instead of
+                    # hammering into 429 again.
+                    group._last_edit = time.monotonic() + (err.retry_after or 1)
+                    return False
+                try:
+                    await asyncio.sleep(
+                        min(float(err.retry_after or 1), _RECEIPT_MAX_WAIT)
+                    )
+                    await self._bot.edit_message_text(
+                        text, chat_id=group.chat_id, message_id=group.message_id
+                    )
+                    return True
+                except Exception as retry_err:  # noqa: BLE001 — fall back to send
+                    logger.warning(
+                        "receipt edit for group %s failed twice (%s) — "
+                        "falling back to a new message",
+                        group.key, retry_err,
+                    )
+                    return False
+            except Exception as err:  # noqa: BLE001
+                logger.warning("cannot edit progress message in chat %s: %s", group.chat_id, err)
                 group.broken = True
-                return
-            logger.debug("edit failed for group %s: %s", group.key, err)
-        except TelegramRetryAfter as err:
-            # Back off hard: pushing the throttle window past the flood wait
-            # keeps later edits quiet instead of hammering into 429 again.
-            group._last_edit = time.monotonic() + (err.retry_after or 1)
-        except Exception as err:  # noqa: BLE001
-            logger.warning("cannot edit progress message in chat %s: %s", group.chat_id, err)
-            group.broken = True
+                return False
 
     async def _finalize_group(self, group: _Group) -> None:
         async with group.lock:
             text = self._receipt_text(group)
+            delivered = False
             if group.message_id is not None and not group.broken:
-                await self._edit_message(group, text)
-            else:
-                try:
-                    await self._bot.send_message(group.chat_id, text)
-                except Exception as err:  # noqa: BLE001
-                    logger.warning("cannot send receipt to chat %s: %s", group.chat_id, err)
+                delivered = await self._edit_message(group, text, urgent=True)
+            if not delivered:
+                delivered = await self._send_receipt(group, text)
+            if not delivered:
+                logger.warning(
+                    "could not deliver the receipt for group %s to chat %s",
+                    group.key, group.chat_id,
+                )
+
+    async def _send_receipt(self, group: _Group, text: str) -> bool:
+        """Deliver the receipt as a new message, waiting out one flood-wait.
+
+        Used when there is no progress message to edit (small files) or when
+        the edit failed — a receipt must never silently vanish.
+        """
+        for attempt in (1, 2):
+            try:
+                await self._bot.send_message(group.chat_id, text)
+                return True
+            except TelegramRetryAfter as err:
+                if attempt == 2:
+                    break
+                await asyncio.sleep(
+                    min(float(err.retry_after or 1), _RECEIPT_MAX_WAIT)
+                )
+            except Exception as err:  # noqa: BLE001
+                logger.warning("cannot send receipt to chat %s: %s", group.chat_id, err)
+                return False
+        return False
 
     # ── text builders ───────────────────────────────────────────────────────
 
@@ -344,9 +428,29 @@ class Notifier:
             lines.append(f"… and {len(completed) - 10} more")
 
         if completed:
-            speeds = [j.avg_speed for j in completed if j.avg_speed]
+            # Honest speeds: a file that finished fetching while still queued
+            # (prefetch) is "transferred" by an instant local copy — report
+            # the Telegram fetch speed instead of flashing a meaningless
+            # "250 MB/s" disk-copy figure, and say which files were ready
+            # ahead of time.
+            ahead = [j for j in completed if j.fetched_ahead]
+            speeds = [j.fetch_bps if j.fetched_ahead else j.avg_speed for j in completed]
+            speeds = [s for s in speeds if s]
             if speeds:
-                lines.append(f"⚡ {human_speed(sum(speeds) / len(speeds))} average")
+                average = sum(speeds) / len(speeds)
+                if len(ahead) == len(completed):
+                    lines.append(
+                        f"⚡ {human_speed(average)} from Telegram — fetched "
+                        "ahead of the queue, copy was instant"
+                    )
+                elif ahead:
+                    lines.append(
+                        f"⚡ {human_speed(average)} average · {len(ahead)} prefetched"
+                    )
+                else:
+                    lines.append(f"⚡ {human_speed(average)} average")
+            elif ahead:
+                lines.append("⚡ instant — already in the local server cache")
         job_ids = " ".join(f"#{j.job_id}" for j in results[:5])
         if job_ids:
             lines.append(f"🧷 {job_ids}")
