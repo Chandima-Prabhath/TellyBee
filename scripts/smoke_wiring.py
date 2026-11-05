@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -76,19 +77,32 @@ async def main() -> int:
     # Sandbox has no route to Telegram: stub the messaging surface so the
     # notifier can be exercised without real API calls.
     sent: list[str] = []
+    deleted: list[tuple[int, int]] = []
 
     async def fake_send(chat_id, text, **kw):  # noqa: ANN001, ANN003
         sent.append(text)
-        return None
+        return SimpleNamespace(message_id=100 + len(sent))
 
     async def fake_edit(chat_id, message_id, text, **kw):  # noqa: ANN001, ANN003
         sent.append(text)
         return None
 
+    async def fake_delete(chat_id=None, message_id=None, **kw):  # noqa: ANN001, ANN003
+        deleted.append((chat_id, message_id))
+        return True
+
     bot.send_message = fake_send  # type: ignore[method-assign]
     bot.edit_message_text = fake_edit  # type: ignore[method-assign]
+    bot.delete_message = fake_delete  # type: ignore[method-assign]
 
-    notifier = Notifier(bot, settings)
+    notifier = Notifier(bot, settings, db=db)
+    await notifier.startup()  # orphaned-window cleanup (no rows yet)
+    # Shrink the window timers so the full lifecycle (create → edit →
+    # receipt → delete-at-drain) fits inside the stub job's 0.6s runtime.
+    import app.services.notifier as notifier_mod
+
+    notifier_mod._WINDOW_DEBOUNCE = 0.15
+    notifier_mod._TICK = 0.05
     manager = DownloadManager(bot, db, settings, notifier=notifier, engine=SlowStubEngine())
     dp = build_dispatcher(settings, db, manager)
     assert dp is not None
@@ -130,7 +144,14 @@ async def main() -> int:
     assert history and history[0]["status"] == "completed", history
     stats = await db.global_stats()
     assert stats["totals"]["completed"] == 1, stats
-    print("✓ job completed, db recorded, stats work")
+    # the unified window: one live message during the job, deleted at drain;
+    # the receipt is the permanent record that stays in the chat
+    assert any("TellyBee" in text for text in sent), sent
+    assert deleted, "the window must be deleted when the queue drains"
+    assert any("Saved" in text for text in sent), sent
+    windows = await db.list_windows()
+    assert windows == [], windows
+    print("✓ unified window lifecycle + receipt verified")
 
     # 4) graceful shutdown
     await manager.shutdown()

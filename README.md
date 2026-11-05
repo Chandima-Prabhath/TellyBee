@@ -28,9 +28,10 @@ Built on **aiogram 3** (fully async), **Python 3.12**, and a
   (one bad file never stops the queue), graceful drain on shutdown.
 - 🧮 **Live queue monitoring from inside the bot** — `/queue` shows active
   transfers with progress bars, pending jobs, worker utilization, and
-  session counters; big downloads get an auto-updating progress message —
-  including **real progress while the local server is still fetching** the
-  file from Telegram (watched on the shared volume).
+  session counters; in chat, each download runs inside **one live window
+  message** that updates in place — including **real progress while the
+  local server is still fetching** the file from Telegram (watched on the
+  shared volume).
 - 🎛 **Two-tier access control** — env-seeded admins & users, plus runtime
   `/allow` / `/disallow` / `/users` management persisted in SQLite.
 - 🗂 **Flexible storage layout** — configurable folder template like
@@ -130,24 +131,30 @@ python -m app.main --check
 | `/pause` `/resume` | admin | pause/resume queue intake |
 | `/health` | admin | same metrics as `/healthz`, in chat |
 
-**What a download looks like in chat:**
+**What a download looks like in chat** — one live *window* message per chat,
+not a notification per file. Forward a new task and the previous window is
+replaced by a fresh one directly under your message; while anything is
+running it updates in place; when the queue drains it disappears and only
+the receipts (the permanent records) remain:
 
 ```
-⬇️ Downloading clip.mp4
-▰▰▰▰▰▰▱▱▱▱ 52%
-14.2 / 27.4 MB • 3.4 MB/s • ETA 4s
+🐝 TellyBee — 2 active · 5 queued · 8 done · 12.3 GB
+🎬 E03.mkv
+▰▰▰▰▱▱▱▱▱▱ 42% · 890 MB / 2.1 GB · 9.2 MB/s · ETA 2m 04s
+📡 E04.mkv — Telegram fetch · 310 MB / 1.7 GB · 4.1 MB/s
+⏳ Queued — E05.mkv, E06.mkv +3 more
 ```
 
-With a local Bot API server, big first-time downloads first show the
-server-side fetch (real progress, watched on the shared volume) before the
-fast local copy takes over:
+With a local Bot API server, big first-time downloads show the server-side
+fetch as real progress (watched on the shared volume) before the fast local
+copy takes over:
 
 ```
-⬇️ Downloading movie.mkv
-📡 Fetching from Telegram
-▰▰▰▰▱▱▱▱▱▱ 41%
-320 / 780 MB • 2.1 MB/s • ETA 3m 39s
+📡 fetching from Telegram · 1m 33s so far (first-time big downloads take a while)
 ```
+
+When everything finishes, the window is deleted and each file/album leaves
+its receipt behind:
 
 ```
 ✅ Saved — 27.4 MB
@@ -188,8 +195,7 @@ Everything is env-driven (`.env` file supported); human-friendly values like
 | `LINK_SSRF_GUARD` | `basic` | link target filter: `basic` (internal IPs only) / `strict` (non-global too) / `off` (no checks) |
 | `ALLOWED_TYPES` | *(all)* | only accept these media types |
 | `BLOCKED_TYPES` | *(none)* | never accept these media types |
-| `PROGRESS_MIN_BYTES` | `2MB` | live progress message threshold |
-| `PROGRESS_EDIT_INTERVAL` | `2.0` | seconds between edits of one progress message (edits are also paced globally, so a busy queue cannot flood the chat) |
+| `PROGRESS_EDIT_INTERVAL` | `2.0` | seconds between edits of the chat's live window message (edits are also paced globally, so many busy chats cannot flood Telegram) |
 | `POLLING_MODE` | `true` | `false` (or set `WEBHOOK_URL`) for webhook |
 | `WEBHOOK_URL` | *(empty)* | e.g. `https://host/tellybee/webhook` (auto-switches mode) |
 | `WEBHOOK_SECRET` | *(empty)* | secret token Telegram echoes back |
@@ -226,8 +232,11 @@ Key design decisions (also documented for AI agents in `AGENT.md`):
 - **Queue in memory, truth on disk** — the live queue is an
   `asyncio.PriorityQueue`; every state transition is mirrored to SQLite so
   `/stats` and post-mortems survive restarts.
-- **One receipt per album** — a media group shares a single chat message
-  that evolves: *progress* → *combined receipt*.
+- **One window per chat, one receipt per album** — all of a chat's live
+  activity is rendered into a single *window* message (replaced whenever a
+  new task arrives so it always sits under the user's latest message,
+  deleted when the queue drains); a media group still ends in exactly one
+  combined receipt, which is the permanent record.
 - **Atomicity everywhere** — partial downloads write `<name>.part` and are
   renamed on success; cancellation and shutdown clean up reliably.
 - **Isolation** — handlers never block (no sync I/O on the hot path), and a
@@ -367,7 +376,7 @@ not apply; the transfer runs at your host's connection speed.
 
 - Send a message containing a link, or use `/link <url>` (up to 5 links per
   message). Files land under the usual template with `{type}` = `url`, get
-  the same receipts, progress messages, `/cancel`, `/stats` rows and
+  the same receipts, live window, `/cancel`, `/stats` rows and
   duplicate detection (by the final URL) as Telegram files.
 - **Multi-connection:** servers that support byte ranges are downloaded over
   `LINK_CONNECTIONS` (default 4) parallel connections, which usually
@@ -433,7 +442,7 @@ before contributing (humans and AI assistants alike).
 | Link download says *“refusing to connect: … resolves to …, a private or otherwise blocked address”* | The SSRF guard refused an internal/loopback address — by design, and the message now names it. If you trust the source (e.g. a host on your own LAN), set `LINK_SSRF_GUARD=off`. On v0.3.0 this message appeared for **every** link — aiohttp moved the resolver's address field and the guard read the wrong one; update to ≥ 0.3.1 (`git pull && docker compose up -d --build`). |
 | Link download fails with *“the server answered HTTP 404/403…”* | The server rejected the request (expired signed URL, auth required, gone). Nothing retryable — fetch a fresh link. |
 | Link download fails with *“rate-limited”* / `429` | The file host is throttling (seen with seedr-style CDNs on busy free accounts). TellyBee already waits out `Retry-After` and falls back to a single connection; if it still fails, wait a few minutes and re-send the link, or set `LINK_CONNECTIONS=1` for single-stream transfers. |
-| Progress message stuck at “Telegram is preparing…” with no % | The volume watcher could not match a growing file in the server's storage (e.g. the job's size is unknown). Display-only — the download itself is unaffected. |
+| Window line stuck at “fetching from Telegram · Ns so far” with no % | The volume watcher could not match a growing file in the server's storage (e.g. the job's size is unknown). Display-only — the download itself is unaffected. |
 | With the queue full, every download crawls at ~0 B/s and the bot feels stuck | Too many simultaneous server-side fetches split TDLib's ~2 MiB per-DC window between them (v0.3.2 ran up to 9 at once). Update to ≥ 0.3.3 — workers and prefetch now share the `FETCH_CONCURRENCY` slots (default 2); on weak links set `FETCH_CONCURRENCY=1`. |
 | Receipts arrive late or some never showed up (v0.3.2) | A busy queue's progress-message edits exceeded what Telegram allows per chat — the flood-waits swallowed receipt edits whole. Update to ≥ 0.3.3: edits are paced globally and receipts are retried / re-sent, never dropped. |
 | Big files download slowly | See *Speeding up big-file downloads* — prefetching is on by default and fetch concurrency is capped sensibly; the `botapi-fast` build multiplies single-file speed; check the host's link/disk. |

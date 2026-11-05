@@ -187,10 +187,12 @@ class Settings(BaseSettings):
     # "off" disables address checks entirely (trusted/private bots).
     link_ssrf_guard: str = "basic"
 
-    # ── Progress UX ─────────────────────────────────────────────────────────
-    # Only files (or albums) at least this big get a live progress message.
-    progress_min_bytes: int = 2 * 1024 * 1024
-    # Minimum seconds between edits of a progress message.
+    # ── Progress UX ───────────────────────────────────────────────────────────
+    # Each chat gets ONE live "window" message (deleted + resent when a new
+    # task arrives, deleted again when the queue drains), so there is no
+    # per-file size threshold anymore: tiny files simply finish before the
+    # ~0.9 s creation debounce fires and never produce a window at all.
+    # Minimum seconds between edits of the window message.
     progress_edit_interval: float = 2.0
 
     # ── Serving mode ────────────────────────────────────────────────────────
@@ -232,9 +234,7 @@ class Settings(BaseSettings):
             )
         return types
 
-    @field_validator(
-        "max_file_size", "chunk_size", "progress_min_bytes", mode="before"
-    )
+    @field_validator("max_file_size", "chunk_size", mode="before")
     @classmethod
     def _parse_bytes(cls, raw: object) -> int:
         return parse_size(raw)

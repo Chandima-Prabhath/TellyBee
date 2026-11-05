@@ -143,9 +143,9 @@ def test_webhook_without_url_rejected():
 
 
 def test_size_strings():
-    s = Settings(bot_token=VALID_TOKEN, chunk_size="256KB", progress_min_bytes="2MB")
+    s = Settings(bot_token=VALID_TOKEN, chunk_size="256KB", link_max_size="10GB")
     assert s.chunk_size == 256 * 1024
-    assert s.progress_min_bytes == 2 * 1024**2
+    assert s.link_max_size == 10 * 1024**3
 
 
 def test_concurrency_bounds():
@@ -221,6 +221,15 @@ def test_stale_prefetch_slots_env_is_ignored(monkeypatch):
     s = Settings(bot_token=VALID_TOKEN)
     assert s.prefetch is True
     assert s.fetch_concurrency == 2
+
+
+def test_stale_progress_min_bytes_env_is_ignored(monkeypatch):
+    """PROGRESS_MIN_BYTES (≤ v0.3.3) no longer exists — the unified window
+    (0.4.0) has no size threshold, so a leftover .env line is ignored."""
+    monkeypatch.setenv("PROGRESS_MIN_BYTES", "2MB")
+    s = Settings(bot_token=VALID_TOKEN)
+    assert s.progress_edit_interval == 2.0
+    assert not hasattr(s, "progress_min_bytes")
 
 
 def test_link_settings_defaults_and_bounds():

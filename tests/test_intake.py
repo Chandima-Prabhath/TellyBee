@@ -176,23 +176,23 @@ def test_has_file_matches_pending_and_active(settings):
     assert manager.has_file("other") is False
 
 
-# ── notifier waiting phase ───────────────────────────────────────────────────
+# ── notifier waiting phase (unified window, 0.4.0) ──────────────────────────
 
 
-def test_progress_text_shows_preparing_phase(settings):
-    from app.services.notifier import Notifier, _Group
+def test_window_text_shows_preparing_phase(settings):
+    from app.services.notifier import Notifier, _Window
 
     notifier = Notifier(bot=object(), settings=settings)
-    group = _Group("k", 1)
+    window = _Window(1)
     job = _fake_job(5)
     job.status = JobStatus.RUNNING
     job.waiting_since = time.monotonic() - 93.0
-    group.jobs[job.job_id] = job
+    window.live[job.job_id] = job
 
-    text = notifier._progress_text(group)
-    assert "Telegram is preparing" in text
+    text = notifier._window_text(window)
+    assert "fetching from Telegram" in text
     assert "1m 33s" in text  # elapsed counter, not a frozen 0% bar
 
     job.waiting_since = None
-    text = notifier._progress_text(group)
-    assert "preparing" not in text
+    text = notifier._window_text(window)
+    assert "so far" not in text

@@ -481,7 +481,7 @@ async def test_watcher_largest_expected_matches_first(settings, tmp_path, monkey
     await engine.aclose()
 
 
-# ── notifier: fetch phase rendering ─────────────────────────────────────────
+# ── notifier: fetch phase rendering (unified window, 0.4.0) ─────────────────
 
 
 class _RecordingBot:
@@ -496,16 +496,19 @@ class _RecordingBot:
     async def edit_message_text(self, text, chat_id=None, message_id=None, **kwargs):
         self.edits.append(text)
 
+    async def delete_message(self, chat_id=None, message_id=None, **kwargs):
+        pass
 
-async def test_notifier_progress_text_during_fetch(settings, tmp_path):
+
+async def test_notifier_window_text_during_fetch(settings, tmp_path):
     bot = _RecordingBot()
     notifier = Notifier(bot, settings)
     job = _job(tmp_path, "movie.mkv", size=800_000_000)
     job.status = JobStatus.QUEUED
     notifier.attach(job)
 
-    group = notifier._groups[f"job:{job.job_id}"]
-    assert group.any_waiting is False
+    window = notifier._windows[100]
+    assert window.live  # registered even before anything runs
 
     # …the job enters the getFile wait with watcher data → real progress
     job.waiting_since = time.monotonic()
@@ -513,30 +516,39 @@ async def test_notifier_progress_text_during_fetch(settings, tmp_path):
     job.fetch_done = 320_000_000
     job.fetch_speed = 2_100_000
 
-    text = notifier._progress_text(group)
-    assert "Fetching from Telegram" in text
+    text = notifier._window_text(window)
+    assert "Telegram fetch" in text
     assert "40%" in text
     assert "305 MB / 763 MB" in text
     assert "2.0 MB/s" in text
-    # a QUEUED-but-fetching job must not be double-counted as "waiting in queue"
-    assert "waiting in queue" not in text
+    # a QUEUED-but-fetching job must not be listed as idle queue depth
+    assert "Queued" not in text
     # the transfer block stays hidden until the copy actually starts
     assert "0 B / 763 MB" not in text
 
     # …without watcher data it degrades to the elapsed-time hint
     job.fetch_done = None
     job.fetch_total = None
-    text = notifier._progress_text(group)
-    assert "Telegram is preparing" in text
-    assert "Fetching from Telegram" not in text
+    text = notifier._window_text(window)
+    assert "fetching from Telegram" in text
+    assert "so far" in text
+    assert "Telegram fetch ·" not in text
+    await notifier.aclose()
 
 
-async def test_notifier_message_created_for_queued_fetching_job(settings, tmp_path):
+async def test_notifier_window_created_for_queued_fetching_job(
+    settings, tmp_path, monkeypatch
+):
     """Regression: with prefetch, jobs fetch while still QUEUED.
 
     Before v0.3 the message was only created when a job reached RUNNING —
-    a queue of big prefetched files showed nothing at all.
+    a queue of big prefetched files showed nothing at all. (v0.4: the chat
+    window is created by intake itself, but the fetching job must be IN it.)
     """
+    import app.services.notifier as notifier_mod
+
+    monkeypatch.setattr(notifier_mod, "_TICK", 0.02)
+    monkeypatch.setattr(notifier_mod, "_WINDOW_DEBOUNCE", 0.05)
     bot = _RecordingBot()
     notifier = Notifier(bot, settings)
     job = _job(tmp_path, "movie.mkv", size=800_000_000)
@@ -548,8 +560,10 @@ async def test_notifier_message_created_for_queued_fetching_job(settings, tmp_pa
     job.fetch_total = 800_000_000
     job.fetch_done = 8_000_000
 
-    await asyncio.sleep(0.9)  # a couple of updater ticks
-    assert bot.sent, "progress message must exist for a QUEUED-but-fetching job"
+    await asyncio.sleep(0.25)
+    assert bot.sent, "window must exist for a QUEUED-but-fetching job"
+    assert "Telegram fetch" in bot.sent[0]
+    assert "fetching" not in bot.sent[0].split("Telegram fetch")[0]
     await notifier.aclose()
 
 

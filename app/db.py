@@ -56,6 +56,14 @@ CREATE INDEX IF NOT EXISTS idx_downloads_user_id    ON downloads (user_id);
 CREATE INDEX IF NOT EXISTS idx_downloads_status     ON downloads (status);
 CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads (created_at);
 CREATE INDEX IF NOT EXISTS idx_downloads_file_unique_id ON downloads (file_unique_id);
+
+-- Live progress-window bookkeeping: which chat currently has a window
+-- message. Its only job is crash cleanup — on startup the bot deletes
+-- every row's message so no frozen "47%" frame is left stuck in a chat.
+CREATE TABLE IF NOT EXISTS progress_windows (
+    chat_id    INTEGER PRIMARY KEY,
+    message_id INTEGER NOT NULL
+);
 """
 
 # Role cache lives here so /allow & /disallow can invalidate it centrally.
@@ -223,6 +231,32 @@ class Database:
         ) as cursor:
             row = await cursor.fetchone()
         return dict(row) if row else None
+
+    # ── progress windows (crash cleanup only) ────────────────────────────────
+
+    async def upsert_window(self, chat_id: int, message_id: int) -> None:
+        """Record the chat's current live progress window message."""
+        await self.conn.execute(
+            """
+            INSERT INTO progress_windows (chat_id, message_id) VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET message_id = excluded.message_id
+            """,
+            (chat_id, message_id),
+        )
+        await self.conn.commit()
+
+    async def drop_window(self, chat_id: int) -> None:
+        await self.conn.execute(
+            "DELETE FROM progress_windows WHERE chat_id = ?", (chat_id,)
+        )
+        await self.conn.commit()
+
+    async def list_windows(self) -> list[tuple[int, int]]:
+        """(chat_id, message_id) of every window still on record."""
+        async with self.conn.execute(
+            "SELECT chat_id, message_id FROM progress_windows"
+        ) as cursor:
+            return [(row["chat_id"], row["message_id"]) for row in await cursor.fetchall()]
 
     async def user_history(self, user_id: int, limit: int = 10) -> list[dict]:
         async with self.conn.execute(

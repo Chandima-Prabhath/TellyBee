@@ -532,22 +532,42 @@ async def test_error_handler_accepts_errorevent(settings):
     assert result is True
 
 
-# ── notifier: edit throttle no longer crashes on _Group ─────────────────────
+# ── notifier: window edit throttle ──────────────────────────────────────────
 
 
-async def test_edit_throttled_updates_last_edit(settings):
-    from app.services.notifier import Notifier, _Group
+class _QuietBot:
+    async def send_message(self, chat_id, text, **kwargs):
+        return SimpleNamespace(message_id=1)
 
-    notifier = Notifier(bot=object(), settings=settings)
-    group = _Group("k", 1)
+    async def edit_message_text(self, text, chat_id=None, message_id=None, **kwargs):
+        pass
 
-    await notifier._edit_throttled(group)  # crashed with AttributeError before
-    assert group._last_edit > 0.0
+    async def delete_message(self, chat_id=None, message_id=None, **kwargs):
+        pass
 
-    group._last_edit = time.monotonic()  # pretend we just edited
-    stamp = group._last_edit
-    await notifier._edit_throttled(group)  # throttled → untouched
-    assert group._last_edit == stamp
+
+async def test_refresh_updates_last_edit(settings):
+    from app.queue.manager import build_job
+    from app.services.notifier import Notifier, _Window
+
+    notifier = Notifier(bot=_QuietBot(), settings=settings)
+    window = _Window(1)
+    window.message_id = 7
+    window.live["x"] = build_job(
+        user=SimpleNamespace(id=1, username="u", first_name="U"),
+        chat_id=1, message_id=1, media_type="document",
+        file_id="f", file_unique_id="u", file_name="n", file_size=5,
+        target_path="/tmp/x", rel_path="x",
+    )
+    settings.progress_edit_interval = 0.0
+
+    await notifier._refresh(window)  # crashed with AttributeError before
+    assert window._last_edit > 0.0
+
+    window._last_edit = time.monotonic()  # pretend we just edited
+    stamp = window._last_edit
+    await notifier._refresh(window)  # throttled → untouched
+    assert window._last_edit == stamp
 
 
 # ── admin: _target_user reads CommandObject.args ────────────────────────────

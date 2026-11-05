@@ -123,16 +123,23 @@ workflow data is injected by parameter name — handlers declare
   and every fetch crawled at ~0 B/s). A prefetch whose fetch is still
   parked on the semaphore leaves `waiting_since` unset — no "preparing"
   message, no fetch progress — until its turn actually comes.
-- The notifier groups jobs by `album_key or f"job:{job_id}"`; a group owns
-  at most one chat message, created lazily only when
-  `expected_bytes >= PROGRESS_MIN_BYTES` **and a job is running or fetching
-  (waiting in `getFile` — with prefetch that happens while still QUEUED)**,
-  edited at most once per `PROGRESS_EDIT_INTERVAL` **plus a global edit
-  pacer (one edit in flight, ~1/s across ALL groups — routine refreshes are
-  dropped, never queued)**, finalized into exactly one receipt. Receipt
-  edits are `urgent`: they bypass the drop rule, wait out one
-  `TelegramRetryAfter` (bounded), and fall back to sending a fresh message
-  — a completed download must never end up without its receipt.
+- The notifier (0.4.0) gives each chat ONE live "window" message. Jobs are
+  tracked per chat in `_Window.live`; `attach()` kicks a debounced (re)creation
+  (`_WINDOW_DEBOUNCE`, sliding ~0.9 s — a burst of forwards coalesces into ONE
+  replacement), and `_recreate()` deletes the old message BEFORE sending the
+  fresh one, so the window always sits under the user's latest message. The
+  window's message lifecycle has a SINGLE writer: the per-window updater task
+  (`_updater`) — `attach`/`finish` only mutate `live`, session counters and
+  `kick_at` (plain atomic writes, no locks). When the chat's `live` drains,
+  the updater deletes the window (`_close`) and pops the chat; receipts are
+  ALWAYS fresh sends now (`_send_receipt`, one bounded `Retry-After` retry)
+  because the window is transient. Window message ids are persisted in the
+  `progress_windows` table so `notifier.startup()` can delete orphans a crash
+  left behind, and `aclose()` sweeps live windows on clean shutdown. Routine
+  window edits go through `_refresh`: per-window `PROGRESS_EDIT_INTERVAL`
+  plus the global pacer (one edit in flight, ~1/s across ALL chats — routine
+  refreshes dropped, never queued). `PROGRESS_MIN_BYTES` is GONE — tiny files
+  simply finish before the debounce fires and never produce a window.
 - Honest receipt speeds (v0.3.3): when a job's server-side fetch finished
   before a worker picked it up (`fetched_ahead`, set by `prefetch()` on
   success or by the `_attempt` cache-hit check), `_finish` reports
@@ -292,11 +299,13 @@ models — see `tests/test_media_types.py` for the pattern.
   Per-group throttling alone under-counts: N live progress messages × 1
   edit / `PROGRESS_EDIT_INTERVAL` is N× the budget → 429 flood-waits → the
   old code DROPPED the failing edit, and for a receipt that meant the
-  receipt vanished silently ("bot updates stuck"). Since 0.3.3 routine
-  refreshes are droppable (skipped when an edit is in flight or the 1s
-  global gap hasn't elapsed — never queued), while receipts are `urgent`:
-  they wait their turn, retry once after a bounded `Retry-After`, and fall
-  back to sending a fresh message.
+  receipt vanished silently ("bot updates stuck"). 0.3.3 added droppable
+  routine edits + urgent receipts; 0.4.0 removes the contention at the
+  root: ONE window message per chat means one edit per interval, and the
+  global pacer (`_EDIT_MIN_GAP`) plus the drop rule remain as a safety net
+  across many busy chats. Window (re)creation NEVER sleeps out a
+  `Retry-After` — it parks `kick_at` (bounded by `_WINDOW_FLOOD_PARK`)
+  and retries on a later tick, keeping the updater responsive.
 - **A prefetched file's receipt must not show its disk-copy speed.** When
   the server-side fetch finished while the job was still queued, the
   worker only stream-copies locally (<1 s) — `avg_speed` then reports

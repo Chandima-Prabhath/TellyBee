@@ -19,7 +19,6 @@ def settings(tmp_path) -> Settings:
         db_path=tmp_path / "data" / "tellybee.db",
         download_concurrency=1,
         max_queue_size=5,
-        progress_min_bytes=1024 * 1024,
         download_retries=1,
     )
 

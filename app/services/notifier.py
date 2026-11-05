@@ -1,15 +1,27 @@
-"""In-chat progress & receipt UX.
+"""In-chat progress & receipt UX — the unified window model (v0.4).
 
-Groups:
+Each chat gets at most ONE live "window" message: a single frame showing
+everything the queue is doing for that chat right now, updated in place —
+an application window, not a stack of task notifications.
 
-* A **single file** forms its own group of one job.
-* An **album** (media group) forms one group with N jobs → exactly one chat
-  message is created and edited through the whole lifecycle, ending in a
-  combined receipt.
+Lifecycle:
 
-Messages are created lazily — only when a group's total size reaches
-``PROGRESS_MIN_BYTES`` — so small files never spam the chat with progress
-messages that would be instantly replaced by the receipt.
+* A new task arrives → the previous window message is **deleted** and a
+  fresh one is sent, debounced ~0.9 s so a burst of forwards (albums,
+  multi-select) collapses into a single replacement. The window therefore
+  always sits directly under the user's latest message.
+* While work runs, the window is edited in place — one message per chat
+  instead of one per job, so there is nothing to fight over the edit
+  budget (the global pacer from 0.3.3 stays as a safety net).
+* When the chat's queue drains, the window is deleted: receipts remain as
+  the permanent record of what was saved.
+* Window message ids are persisted in SQLite, so a crash/restart deletes
+  orphaned frames instead of leaving a frozen "47%" message in the chat
+  forever.
+
+Receipts keep their 0.3.3 honesty rules (fetch vs copy speeds, prefetched
+files, one combined receipt per album) and are always sent as fresh
+messages — the window they used to be edited into is transient now.
 """
 
 from __future__ import annotations
@@ -28,15 +40,23 @@ from app.utils.sizes import human_size, human_speed
 
 logger = logging.getLogger(__name__)
 
-#: Minimum seconds between ANY two progress-message edits, across all groups.
-#: Telegram tolerates roughly one edit per second per chat sustained — a busy
-#: queue easily has more live progress messages than that, and unpaced edits
-#: used to turn into a 429 flood-wait storm that froze every message in the
-#: chat ("stuck updates") and swallowed receipts.
+#: Updater loop tick (seconds) — how often a window's state is re-examined.
+_TICK = 0.4
+#: Sliding debounce (seconds) for (re)creating a window after an intake:
+#: forwards that arrive within this window coalesce into ONE replacement.
+_WINDOW_DEBOUNCE = 0.9
+#: Minimum seconds between ANY two progress-message edits, across all chats.
+#: With one window per chat this rarely binds, but it is a cheap safety net
+#: against a bot-wide 429 storm.
 _EDIT_MIN_GAP = 1.0
-#: Upper bound (seconds) for how long a receipt edit/send may sleep on a
-#: Telegram ``Retry-After`` before falling back to another strategy.
+#: Upper bound (seconds) for how long a receipt send may sleep on a
+#: Telegram ``Retry-After`` before falling back.
 _RECEIPT_MAX_WAIT = 15.0
+#: Cap (seconds) for parking the next window (re)send past a Retry-After —
+#: the updater never sleeps a flood-wait away, it just retries later.
+_WINDOW_FLOOD_PARK = 30.0
+#: How many active entries (job or collapsed album) get detailed lines.
+_MAX_ACTIVE_ENTRIES = 6
 
 _TYPE_ICONS = {
     "photo": "🖼",
@@ -55,106 +75,150 @@ def type_icon(media_type: str) -> str:
     return _TYPE_ICONS.get(media_type, "📁")
 
 
-class _Group:
-    """A set of jobs sharing one chat message."""
+def _short(name: str | None, limit: int) -> str:
+    text = name or "file"
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
-    __slots__ = ("key", "chat_id", "message_id", "jobs", "results", "lock",
-                 "updater_task", "created_at", "broken", "_last_edit")
+
+class _Group:
+    """Receipt aggregation: the jobs of one single file or one album."""
+
+    __slots__ = ("key", "chat_id", "jobs", "results")
 
     def __init__(self, key: str, chat_id: int):
         self.key = key
         self.chat_id = chat_id
-        self.message_id: int | None = None
         self.jobs: dict[str, DownloadJob] = {}
         self.results: list[DownloadJob] = []
-        self.lock = asyncio.Lock()
+
+
+class _Window:
+    """The single live progress message of one chat.
+
+    State mutated from handler/worker context (``attach``/``finish``):
+    ``live``, the session counters and ``kick_at`` — plain dict/int writes,
+    atomic under asyncio. The *message lifecycle* (send / edit / delete of
+    the window message itself) belongs exclusively to the updater task:
+    one writer per message, no locks needed.
+    """
+
+    __slots__ = ("chat_id", "message_id", "live", "done", "failed",
+                 "cancelled", "kick_at", "broken", "updater_task", "_last_edit")
+
+    def __init__(self, chat_id: int):
+        self.chat_id = chat_id
+        self.message_id: int | None = None
+        self.live: dict[str, DownloadJob] = {}
+        self.done = 0
+        self.failed = 0
+        self.cancelled = 0
+        #: monotonic deadline after which the window (re)creation fires
+        self.kick_at: float | None = None
+        #: set when the chat turned out unreachable; a new intake resets it
+        self.broken = False
         self.updater_task: asyncio.Task | None = None
-        self.created_at = time.monotonic()
-        self.broken = False  # set when sending failed (chat unreachable)
-        self._last_edit = 0.0  # last progress-message edit (throttle)
+        self._last_edit = 0.0  # last successful/attempted edit (throttle)
 
     @property
-    def total_bytes(self) -> int:
-        return sum(j.total_bytes or j.file_size or 0 for j in self.jobs.values())
-
-    @property
-    def bytes_done(self) -> int:
-        return sum(j.bytes_done for j in self.jobs.values())
-
-    @property
-    def expected_bytes(self) -> int:
-        """Best-known total (declared size of every job, 0 when unknown)."""
-        return sum((j.total_bytes or j.file_size or 0) for j in self.jobs.values())
-
-    @property
-    def fraction(self) -> float | None:
-        total = self.expected_bytes
-        return self.bytes_done / total if total else None
-
-    @property
-    def speed(self) -> float:
-        return sum(j.speed_bps for j in self.jobs.values() if j.status is JobStatus.RUNNING)
-
-    @property
-    def any_running(self) -> bool:
-        return any(j.status is JobStatus.RUNNING for j in self.jobs.values())
-
-    @property
-    def any_waiting(self) -> bool:
-        """Any job parked in getFile while the local server fetches it.
-
-        With prefetching this happens while the job is still QUEUED — the
-        message must exist and keep updating even before a worker starts it,
-        otherwise a queue of big files shows nothing at all.
-        """
-        return any(j.waiting_since is not None for j in self.jobs.values())
-
-    def eta(self) -> float | None:
-        speed = self.speed
-        total = self.expected_bytes
-        if not speed or not total:
-            return None
-        return max(0.0, (total - self.bytes_done) / speed)
+    def has_work(self) -> bool:
+        return bool(self.live) or self.kick_at is not None
 
 
 class Notifier:
-    """Turns queue events into chat messages."""
+    """Turns queue events into one window per chat plus receipts."""
 
-    def __init__(self, bot: Bot, settings: Settings):
+    def __init__(self, bot: Bot, settings: Settings, db=None):
         self._bot = bot
         self._settings = settings
+        self._db = db
         self._groups: dict[str, _Group] = {}
-        # Global pacing for message edits (see _EDIT_MIN_GAP): one edit in
+        self._windows: dict[int, _Window] = {}
+        # Global pacing for window edits (see _EDIT_MIN_GAP): one edit in
         # flight at a time, routine refreshes dropped rather than queued.
         self._edit_lock = asyncio.Lock()
         self._next_edit_at = 0.0
 
+    # ── lifecycle ───────────────────────────────────────────────────────────
+
+    async def startup(self) -> None:
+        """Delete progress windows orphaned by a crash/restart.
+
+        Without this, a hard restart would leave the last frozen frame
+        ("47%", 2.1 MB/s…) stuck in the chat forever — the ids only ever
+        existed in memory. They are persisted in SQLite precisely so this
+        cleanup can find them.
+        """
+        if self._db is None:
+            return
+        try:
+            rows = await self._db.list_windows()
+        except Exception:  # noqa: BLE001 — best effort, never block startup
+            logger.warning("could not read orphaned progress windows", exc_info=True)
+            return
+        for chat_id, message_id in rows:
+            await self._delete_quietly(chat_id, message_id)
+            await self._db_drop(chat_id)
+        if rows:
+            logger.info("cleaned up %d orphaned progress window(s)", len(rows))
+
     async def aclose(self) -> None:
-        for group in list(self._groups.values()):
-            if group.updater_task and not group.updater_task.done():
-                group.updater_task.cancel()
+        for window in list(self._windows.values()):
+            if window.updater_task and not window.updater_task.done():
+                window.updater_task.cancel()
         await asyncio.gather(
-            *(g.updater_task for g in self._groups.values() if g.updater_task),
+            *(w.updater_task for w in self._windows.values() if w.updater_task),
             return_exceptions=True,
         )
+        # Final sweep: a window still holding a message (queue drained
+        # between the last updater tick and this close) is deleted now so
+        # the normal shutdown path leaves no orphan either.
+        for window in list(self._windows.values()):
+            message_id = window.message_id
+            if message_id is not None:
+                window.message_id = None
+                await self._delete_quietly(window.chat_id, message_id)
+                await self._db_drop(window.chat_id)
+        self._windows.clear()
         self._groups.clear()
 
     # ── events from the manager ─────────────────────────────────────────────
 
     def attach(self, job: DownloadJob) -> None:
-        """Register a freshly queued job with its (possibly shared) group."""
+        """Register a freshly queued job with its group and chat window."""
         key = job.album_key or f"job:{job.job_id}"
         group = self._groups.get(key)
         if group is None:
             group = _Group(key, job.chat_id)
             self._groups[key] = group
-            group.updater_task = asyncio.create_task(
-                self._updater(group), name=f"tellybee-notify-{key}"
-            )
         group.jobs[job.job_id] = job
 
+        window = self._windows.get(job.chat_id)
+        if window is None:
+            window = _Window(job.chat_id)
+            self._windows[job.chat_id] = window
+        window.live[job.job_id] = job
+        window.broken = False  # a new intake is a new chance for the chat
+        # Debounced (re)creation: bursts collapse into one replacement,
+        # spaced intakes each get their own fresh "latest" window.
+        window.kick_at = time.monotonic() + _WINDOW_DEBOUNCE
+        self._ensure_updater(window)
+
     async def finish(self, job: DownloadJob) -> None:
-        """A job reached a terminal state; finalize the group when last."""
+        """A job reached a terminal state; receipt + window bookkeeping."""
+        # Window first: the job is factually done, so it must leave the
+        # live set immediately (even if the receipt below waits out a
+        # flood-wait, the window must not show it as still running).
+        window = self._windows.get(job.chat_id)
+        if window is not None:
+            window.live.pop(job.job_id, None)
+            if job.status is JobStatus.COMPLETED:
+                window.done += 1
+            elif job.status is JobStatus.FAILED:
+                window.failed += 1
+            elif job.status is JobStatus.CANCELLED:
+                window.cancelled += 1
+            self._ensure_updater(window)
+
         key = job.album_key or f"job:{job.job_id}"
         group = self._groups.get(key)
         if group is None:  # e.g. submit failed midway; nothing to show
@@ -162,141 +226,166 @@ class Notifier:
         group.jobs.pop(job.job_id, None)
         group.results.append(job)
         if not group.jobs:
-            if group.updater_task and not group.updater_task.done():
-                group.updater_task.cancel()
-            await self._finalize_group(group)
             self._groups.pop(key, None)
+            await self._finalize_group(group)
 
-    # ── internals ───────────────────────────────────────────────────────────
+    # ── the window updater (single writer of the window message) ────────────
 
-    async def _updater(self, group: _Group) -> None:
-        """Periodically refresh a group's progress message."""
+    def _ensure_updater(self, window: _Window) -> None:
+        if window.updater_task is None or window.updater_task.done():
+            window.updater_task = asyncio.create_task(
+                self._updater(window), name=f"tellybee-window-{window.chat_id}"
+            )
+
+    async def _updater(self, window: _Window) -> None:
+        """Drive one chat's window: (re)create, refresh, close."""
         try:
             while True:
-                await asyncio.sleep(0.4)
-                # Lazily create the message once transfer actually started
-                # (or the server-side fetch — with prefetch a QUEUED job is
-                # already fetching) and the group is big enough to be worth
-                # it. A send that hit a flood-wait parks the next attempt
-                # beyond the announced window (group._last_edit).
-                if (
-                    group.message_id is None
-                    and not group.broken
-                    and time.monotonic() >= group._last_edit
-                    and (group.any_running or group.any_waiting)
-                    and group.expected_bytes >= self._settings.progress_min_bytes
-                ):
-                    async with group.lock:
-                        if group.message_id is None and group.jobs:
-                            await self._send_progress_message(group)
-                if group.message_id is not None and (group.any_running or group.any_waiting):
-                    await self._edit_throttled(group)
+                await asyncio.sleep(_TICK)
+                if window.kick_at is not None:
+                    if time.monotonic() >= window.kick_at:
+                        await self._recreate(window)
+                    continue  # never edit a frame that is about to be replaced
+                if window.live:
+                    if window.message_id is not None and not window.broken:
+                        await self._refresh(window)
+                elif window.message_id is not None:
+                    await self._close(window)  # queue drained → close the app
+                    return
+                elif not window.has_work:
+                    return  # idle and nothing pending — stop the task
         except asyncio.CancelledError:
             return
 
-    async def _send_progress_message(self, group: _Group) -> None:
-        try:
-            message = await self._bot.send_message(
-                group.chat_id, self._progress_text(group)
-            )
-            group.message_id = message.message_id
-        except TelegramRetryAfter as err:
-            # No sleeping here (runs under the group lock): park the next
-            # creation attempt beyond the announced window instead.
-            group._last_edit = time.monotonic() + (err.retry_after or 1)
-        except Exception as err:  # noqa: BLE001 — chat may be unreachable
-            logger.warning("cannot send progress message to chat %s: %s", group.chat_id, err)
-            group.broken = True
+    async def _recreate(self, window: _Window) -> None:
+        """Abort the previous window message and send a fresh one.
 
-    async def _edit_throttled(self, group: _Group) -> None:
-        now = time.monotonic()
-        if now - group._last_edit < self._settings.progress_edit_interval:
-            return
-        group._last_edit = now
-        await self._edit_message(group, self._progress_text(group))
-
-    async def _edit_message(self, group: _Group, text: str, urgent: bool = False) -> bool:
-        """Edit a group's message, paced globally; returns True if delivered.
-
-        Routine progress refreshes are *droppable*: when another edit is in
-        flight or the global gap has not elapsed, the refresh is simply
-        skipped — the next updater tick retries with fresher numbers. This
-        keeps the total edit rate inside what Telegram tolerates per chat,
-        instead of queueing a backlog that ends in 429 flood-waits.
-
-        Receipt edits (``urgent=True``) wait their turn instead of being
-        dropped and survive a flood-wait: one bounded retry after the
-        announced ``Retry-After``, else the caller falls back to sending
-        the receipt as a fresh message — a completed download must never
-        end up without its receipt.
+        Delete-then-send: if the send fails, the worst case is "no window
+        for now" (the next intake re-kicks), never two competing frames.
         """
-        if group.message_id is None or group.broken:
-            return False
-        if not urgent:
-            now = time.monotonic()
-            if self._edit_lock.locked() or now < self._next_edit_at:
-                return False  # droppable refresh — never queue edits up
+        window.kick_at = None
+        if window.broken or not window.live:
+            return
+
+        old_id = window.message_id
+        if old_id is not None:
+            window.message_id = None
+            await self._delete_quietly(window.chat_id, old_id)
+            await self._db_drop(window.chat_id)
+
+        text = self._window_text(window)
+        try:
+            message = await self._bot.send_message(window.chat_id, text)
+        except TelegramRetryAfter as err:
+            # No sleeping the updater away: park the next attempt beyond
+            # the announced window (bounded) and try again then.
+            window.kick_at = time.monotonic() + min(
+                float(err.retry_after or 1), _WINDOW_FLOOD_PARK
+            )
+            return
+        except Exception as err:  # noqa: BLE001 — chat may be unreachable
+            logger.warning(
+                "cannot send progress window to chat %s: %s", window.chat_id, err
+            )
+            window.broken = True
+            return
+        window.message_id = message.message_id
+        window._last_edit = time.monotonic()
+        await self._db_upsert(window.chat_id, window.message_id)
+
+    async def _refresh(self, window: _Window) -> None:
+        """Routine in-place edit of the window, paced and droppable.
+
+        With one message per chat there is no contention to speak of; the
+        per-window interval plus the global gap are kept so a restart of
+        heavy activity can never re-create the 0.3.3 edit storm.
+        """
+        now = time.monotonic()
+        if now - window._last_edit < self._settings.progress_edit_interval:
+            return
+        if self._edit_lock.locked() or now < self._next_edit_at:
+            return  # droppable refresh — never queue edits up
+        window._last_edit = now
         async with self._edit_lock:
             self._next_edit_at = time.monotonic() + _EDIT_MIN_GAP
             try:
                 await self._bot.edit_message_text(
-                    text, chat_id=group.chat_id, message_id=group.message_id
+                    self._window_text(window),
+                    chat_id=window.chat_id,
+                    message_id=window.message_id,
                 )
-                return True
             except TelegramBadRequest as err:
-                if "message is not modified" in str(err).lower():
-                    return True
-                if "message to edit not found" in str(err).lower():
-                    group.broken = True
-                    return False
-                logger.debug("edit failed for group %s: %s", group.key, err)
-                return False
+                message = str(err).lower()
+                if "message is not modified" in message:
+                    return
+                if "message to edit not found" in message:
+                    # The user deleted the window himself — rebuild it on
+                    # the next tick instead of giving up on the chat.
+                    window.message_id = None
+                    window.kick_at = time.monotonic()
+                    return
+                logger.debug("window edit failed in chat %s: %s", window.chat_id, err)
             except TelegramRetryAfter as err:
-                if not urgent:
-                    # Back off hard: pushing the throttle window past the
-                    # flood wait keeps later edits quiet instead of
-                    # hammering into 429 again.
-                    group._last_edit = time.monotonic() + (err.retry_after or 1)
-                    return False
-                try:
-                    await asyncio.sleep(
-                        min(float(err.retry_after or 1), _RECEIPT_MAX_WAIT)
-                    )
-                    await self._bot.edit_message_text(
-                        text, chat_id=group.chat_id, message_id=group.message_id
-                    )
-                    return True
-                except Exception as retry_err:  # noqa: BLE001 — fall back to send
-                    logger.warning(
-                        "receipt edit for group %s failed twice (%s) — "
-                        "falling back to a new message",
-                        group.key, retry_err,
-                    )
-                    return False
+                # Back off hard: park this window's edit budget past the
+                # flood wait so later ticks stay quiet.
+                window._last_edit = time.monotonic() + (err.retry_after or 1)
             except Exception as err:  # noqa: BLE001
-                logger.warning("cannot edit progress message in chat %s: %s", group.chat_id, err)
-                group.broken = True
-                return False
+                logger.warning(
+                    "cannot edit progress window in chat %s: %s", window.chat_id, err
+                )
+
+    async def _close(self, window: _Window) -> None:
+        """The chat's queue drained: delete the window (receipts stay)."""
+        message_id = window.message_id
+        window.message_id = None
+        if message_id is not None:
+            await self._delete_quietly(window.chat_id, message_id)
+        await self._db_drop(window.chat_id)
+        # Reset the session counters — a later intake starts a fresh window.
+        window.done = window.failed = window.cancelled = 0
+        if self._windows.get(window.chat_id) is window and not window.live:
+            self._windows.pop(window.chat_id, None)
+
+    # ── helpers ─────────────────────────────────────────────────────────────
+
+    async def _delete_quietly(self, chat_id: int, message_id: int) -> None:
+        try:
+            await self._bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception as err:  # noqa: BLE001 — already gone is fine
+            logger.debug("delete_message(%s, %s) failed: %s", chat_id, message_id, err)
+
+    async def _db_upsert(self, chat_id: int, message_id: int) -> None:
+        if self._db is None:
+            return
+        try:
+            await self._db.upsert_window(chat_id, message_id)
+        except Exception:  # noqa: BLE001 — bookkeeping must never break UX
+            logger.warning("could not persist progress window row", exc_info=True)
+
+    async def _db_drop(self, chat_id: int) -> None:
+        if self._db is None:
+            return
+        try:
+            await self._db.drop_window(chat_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("could not drop progress window row", exc_info=True)
+
+    # ── receipts ────────────────────────────────────────────────────────────
 
     async def _finalize_group(self, group: _Group) -> None:
-        async with group.lock:
-            text = self._receipt_text(group)
-            delivered = False
-            if group.message_id is not None and not group.broken:
-                delivered = await self._edit_message(group, text, urgent=True)
-            if not delivered:
-                delivered = await self._send_receipt(group, text)
-            if not delivered:
-                logger.warning(
-                    "could not deliver the receipt for group %s to chat %s",
-                    group.key, group.chat_id,
-                )
+        text = self._receipt_text(group)
+        if not await self._send_receipt(group, text):
+            logger.warning(
+                "could not deliver the receipt for group %s to chat %s",
+                group.key, group.chat_id,
+            )
 
     async def _send_receipt(self, group: _Group, text: str) -> bool:
         """Deliver the receipt as a new message, waiting out one flood-wait.
 
-        Used when there is no progress message to edit (small files) or when
-        the edit failed — a receipt must never silently vanish.
+        Receipts are the permanent record of a download, so they may not be
+        silently dropped: one bounded retry after the announced
+        ``Retry-After``; a hard failure is logged loudly.
         """
         for attempt in (1, 2):
             try:
@@ -315,83 +404,111 @@ class Notifier:
 
     # ── text builders ───────────────────────────────────────────────────────
 
-    def _progress_text(self, group: _Group) -> str:
-        running = [j for j in group.jobs.values() if j.status is JobStatus.RUNNING]
-        queued = [j for j in group.jobs.values() if j.status is JobStatus.QUEUED]
-        waiting = [j for j in group.jobs.values() if j.waiting_since is not None]
-        count = len(group.jobs) + len(group.results)
-        lines: list[str] = []
+    @staticmethod
+    def _is_active(job: DownloadJob) -> bool:
+        """Running, or queued-but-fetching (prefetch parks jobs in getFile)."""
+        return job.status is JobStatus.RUNNING or job.waiting_since is not None
 
-        if count > 1:
-            done = len(group.results)
-            lines.append(f"⬇️ <b>Downloading {plural_files(count)}</b> — {done}/{count} done")
-        else:
-            job = running[0] if running else next(iter(group.jobs.values()), None)
-            name = job.file_name or job.rel_path if job else "file"
-            lines.append(f"⬇️ <b>Downloading</b> {escape(name)}")
+    def _window_text(self, window: _Window) -> str:
+        live = sorted(window.live.values(), key=lambda j: j.seq)
+        # Collapse each album into one display entry — ten near-identical
+        # lines for one media group is noise, one bar with sums is signal.
+        grouped: dict[str, list[DownloadJob]] = {}
+        for job in live:
+            grouped.setdefault(job.album_key or f"single:{job.job_id}", []).append(job)
+        active_entries = [jobs for jobs in grouped.values() if any(map(self._is_active, jobs))]
+        queued_jobs = [j for j in live if not self._is_active(j)]
 
-        # Phase 1 — the local Bot API server fetching the file from Telegram
-        # (the getFile wait). The engine's volume watcher fills fetch_done /
-        # fetch_speed, so this is real progress; without it (or in cloud mode)
-        # fall back to a growing elapsed counter instead of a frozen 0% bar
-        # that looks like a hang.
+        active_count = sum(1 for j in live if self._is_active(j))
+        parts: list[str] = []
+        if active_count:
+            parts.append(f"{active_count} active")
+        if queued_jobs:
+            parts.append(f"{len(queued_jobs)} queued")
+        if window.done:
+            parts.append(f"{window.done} done")
+        if window.failed:
+            parts.append(f"{window.failed} failed")
+        if window.cancelled:
+            parts.append(f"{window.cancelled} cancelled")
+        header = "🐝 <b>TellyBee</b>"
+        if parts:
+            header += f" — {' · '.join(parts)}"
+        volume = sum((j.total_bytes or j.file_size or 0) for j in live)
+        if volume:
+            header += f" · {human_size(volume)}"
+        lines: list[str] = [header]
+
+        shown = 0
+        for jobs in active_entries[:_MAX_ACTIVE_ENTRIES]:
+            lines.extend(self._entry_lines(jobs))
+            shown += 1
+        if len(active_entries) > shown:
+            lines.append(f"… +{len(active_entries) - shown} more in progress")
+
+        if queued_jobs:
+            names = ", ".join(
+                escape(_short(j.file_name or j.rel_path, 24)) for j in queued_jobs[:3]
+            )
+            hidden = len(queued_jobs) - 3
+            suffix = f" +{hidden} more" if hidden > 0 else ""
+            lines.append(f"⏳ <b>Queued</b> — {names}{suffix}")
+        return "\n".join(lines)
+
+    def _entry_lines(self, jobs: list[DownloadJob]) -> list[str]:
+        """Detailed block for one active job or one collapsed album."""
+        first = jobs[0]
+        icon = type_icon(first.media_type)
+        name = _short(first.file_name or first.rel_path, 44)
+        if len(jobs) > 1:
+            name = f"{name} +{len(jobs) - 1}"
+        lines = [f"{icon} <b>{escape(name)}</b>"]
+
+        # Phase 1 — the local Bot API server fetching from Telegram (the
+        # getFile wait). The engine's volume watcher fills fetch_done /
+        # fetch_speed, so this is real progress; without it degrade to a
+        # growing elapsed counter, never a frozen 0% bar.
+        waiting = [j for j in jobs if j.waiting_since is not None]
         if waiting:
             fetch_total = sum(j.fetch_total or j.file_size or 0 for j in waiting)
             fetch_done = sum(j.fetch_done or 0 for j in waiting)
             speed = sum(j.fetch_speed for j in waiting)
             if fetch_total and fetch_done:
                 frac = min(1.0, fetch_done / fetch_total)
-                lines.append(
-                    f"📡 <b>Fetching from Telegram</b>"
-                    f"{' — ' + plural_files(len(waiting)) if len(waiting) > 1 else ''}"
-                )
                 lines.append(f"<code>{progress_bar(frac)} {pct(frac)}</code>")
                 detail = (
-                    f"{human_size(fetch_done)} / {human_size(fetch_total)} "
-                    f"• {human_speed(speed)}"
+                    f"📡 Telegram fetch · {human_size(fetch_done)} / "
+                    f"{human_size(fetch_total)} · {human_speed(speed)}"
                 )
                 if speed > 0 and frac < 1.0:
-                    detail += f" • ETA {fmt_eta((fetch_total - fetch_done) / speed)}"
+                    detail += f" · ETA {fmt_eta((fetch_total - fetch_done) / speed)}"
                 lines.append(detail)
             else:
-                elapsed = max(time.monotonic() - j.waiting_since for j in waiting)  # type: ignore[arg-type]
+                elapsed = max(time.monotonic() - j.waiting_since for j in waiting)
                 lines.append(
-                    f"⏳ Telegram is preparing {plural_files(len(waiting))} — "
-                    f"{fmt_eta(elapsed)} so far (first-time big downloads take a while)"
+                    f"📡 fetching from Telegram · {fmt_eta(elapsed)} so far "
+                    "(first-time big downloads take a while)"
                 )
+            return lines
 
-        # Phase 2 — the local copy into the downloads folder (fast). Only
-        # rendered once it actually runs, so the visible bar never "resets"
-        # from 100% fetch to 0% copy: the fetch block simply disappears and
-        # the copy block takes over.
-        transferring = group.bytes_done > 0 or any(
-            j.status is JobStatus.RUNNING and j.waiting_since is None
-            for j in group.jobs.values()
-        )
-        fraction = group.fraction
+        # Phase 2 — the transfer itself (cloud mode, or the fast local copy).
+        transferring = [
+            j for j in jobs if j.status is JobStatus.RUNNING and j.waiting_since is None
+        ]
         if transferring:
-            if fraction is not None:
-                lines.append(f"<code>{progress_bar(fraction)} {pct(fraction)}</code>")
-            lines.append(
-                f"{human_size(group.bytes_done)} / {human_size(group.expected_bytes)}"
-                f" • {human_speed(group.speed)}"
-            )
-            eta = group.eta()
-            if eta is not None and fraction is not None and fraction < 1:
-                lines[-1] += f" • ETA {fmt_eta(eta)}"
-
-        if running and count == 1:
-            pass  # header already carries the file name
-        elif running:
-            for job in running[:3]:
-                lines.append(
-                    f"  {type_icon(job.media_type)} {escape(job.file_name or job.rel_path)} "
-                    f"— {pct(job.progress_fraction)}"
-                )
-        queued_left = [j for j in queued if j.waiting_since is None]
-        if queued_left:
-            lines.append(f"⏳ {plural_files(len(queued_left))} waiting in queue")
-        return "\n".join(lines)
+            total = sum((j.total_bytes or j.file_size or 0) for j in jobs)
+            done = sum(j.bytes_done for j in jobs)
+            speed = sum(j.speed_bps for j in transferring)
+            if total:
+                frac = min(1.0, done / total)
+                lines.append(f"<code>{progress_bar(frac)} {pct(frac)}</code>")
+                detail = f"{human_size(done)} / {human_size(total)} · {human_speed(speed)}"
+                if speed > 0 and frac < 1.0:
+                    detail += f" · ETA {fmt_eta((total - done) / speed)}"
+                lines.append(detail)
+            else:
+                lines.append("⏬ transferring…")
+        return lines
 
     def _receipt_text(self, group: _Group) -> str:
         results = group.results

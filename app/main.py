@@ -185,7 +185,8 @@ async def run() -> None:
     await db.seed_users(settings.admin_ids, settings.allowed_user_ids)
 
     bot = build_bot(settings)
-    notifier = Notifier(bot, settings)
+    notifier = Notifier(bot, settings, db=db)
+    await notifier.startup()  # delete progress windows orphaned by a crash
     manager = DownloadManager(bot, db, settings, notifier=notifier)
     dp = build_dispatcher(settings, db, manager)
 
