@@ -162,3 +162,53 @@ def test_receipt_text_hides_prefetch_mechanics_keeps_honest_speed(tmp_path):
     assert "5.5 MB/s" in text  # honest number survives, quietly
     assert "310 MB" in text
     assert "user/document" in text  # on-disk location stays
+
+
+async def test_recreate_never_leaves_chat_without_a_window(tmp_path):
+    """Regression: a flood-wait during (re)creation must not delete the old
+    frame first — 10 quick receipts once triggered a 429 and the chat lost
+    its window until the park expired (seen live as the window vanishing
+    around the 10th file of a forwarded series)."""
+    from aiogram.exceptions import TelegramRetryAfter
+
+    class FloodBot(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.order: list[str] = []
+            self.flood_next = True
+
+        async def send_message(self, chat_id, text, **kwargs):
+            if self.flood_next:
+                self.flood_next = False
+                raise TelegramRetryAfter(method=None, message="flood", retry_after=9)
+            self.order.append("send")
+            return await super().send_message(chat_id, text, **kwargs)
+
+        async def delete_message(self, chat_id, message_id):
+            self.order.append("delete")
+            await super().delete_message(chat_id, message_id)
+
+    bot, settings = FloodBot(), _settings(tmp_path)
+    notifier = Notifier(bot, settings, db=None)
+    try:
+        j1, j2 = _job("ep01.mkv", 100), _job("ep02.mkv", 100)
+        notifier.attach(j1)
+        notifier.attach(j2)
+        await _drain()
+        window = notifier._windows[100]
+        window.kick_at = None
+        window.message_id = 555
+
+        # First attempt floods: the old frame (555) must survive untouched.
+        await notifier._recreate(window)
+        assert window.message_id == 555, "old frame was dropped before the new one existed"
+        assert window.kick_at is not None, "recreate is parked for a retry, not abandoned"
+
+        # Second attempt succeeds: send lands BEFORE the old frame is deleted.
+        await notifier._recreate(window)
+        assert window.message_id != 555
+        assert bot.order[:2] == ["send", "delete"], (
+            f"send must precede delete, got {bot.order}"
+        )
+    finally:
+        await notifier.aclose()

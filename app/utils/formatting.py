@@ -4,10 +4,30 @@ from __future__ import annotations
 
 import html
 
+from app.utils.sizes import human_size, human_speed
+
 
 def escape(value: str | None) -> str:
     """HTML-escape user-provided text before sending with parse_mode=HTML."""
     return html.escape(value or "", quote=False)
+
+
+def transfer_meta(done: float, total: float, speed: float) -> str:
+    """One honest meta line: bytes, speed, ETA — or an explicit stall.
+
+    Speed 0.0 means the engine saw consecutive no-growth polls (a true
+    stall), so that state is named instead of hinted at with a dash.
+    Below 1 KB/s an ETA is meaningless — a decaying average once printed
+    "ETA 3512250h" — so slow trickles keep the byte counters and drop
+    the ETA instead of lying with one.
+    """
+    if speed <= 0:
+        return f"{human_size(done)} / {human_size(total)} · ⏸ stalled"
+    meta = f"{human_size(done)} / {human_size(total)} · {human_speed(speed)}"
+    frac = (total - done) / total if total else 1.0
+    if speed >= 1024 and 0.0 < frac < 1.0:
+        meta += f" · ETA {fmt_eta((total - done) / speed)}"
+    return meta
 
 
 def progress_bar(fraction: float | None, width: int = 10) -> str:

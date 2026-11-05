@@ -1,7 +1,13 @@
-"""Per-user flood control (sliding window).
+"""Per-user flood control (sliding window) for text/command spam.
 
-Album messages (same ``media_group_id``) are exempt: Telegram delivers them
-as a burst and the album middleware aggregates them anyway.
+Media intake is **never** dropped: forwarding a whole series in one go
+is a normal, supported flow, and every real bound lives downstream of
+intake anyway — MAX_QUEUE_SIZE, disk headroom, duplicate detection, and
+the engine's FETCH_CONCURRENCY pacing. Media messages are not even
+counted against the window, so a 50-file forward can't starve the
+user's ability to send /status right after.
+
+Album messages (same ``media_group_id``) likewise sail through.
 """
 
 from __future__ import annotations
@@ -13,6 +19,7 @@ from aiogram import BaseMiddleware
 from aiogram.types import Message, TelegramObject
 
 from app.config import Settings
+from app.services.media_types import extract_media
 
 
 class ThrottlingMiddleware(BaseMiddleware):
@@ -23,7 +30,7 @@ class ThrottlingMiddleware(BaseMiddleware):
         self._last_notice: dict[int, float] = {}
 
     async def __call__(self, handler, event: TelegramObject, data: dict):
-        if isinstance(event, Message) and event.media_group_id:
+        if isinstance(event, Message) and (event.media_group_id or extract_media(event)):
             return await handler(event, data)
 
         user = data.get("event_from_user")
@@ -47,8 +54,9 @@ class ThrottlingMiddleware(BaseMiddleware):
         if isinstance(event, Message):
             try:
                 await event.answer(
-                    f"🐢 Easy there — max {self._rate} messages per "
-                    f"{int(self._window)}s. Try again in a moment."
+                    f"🐢 Easy there — that's more than {self._rate} messages in "
+                    f"{int(self._window)}s. Files and media always get through; "
+                    "give it a moment for the rest."
                 )
             except Exception:  # noqa: BLE001
                 pass

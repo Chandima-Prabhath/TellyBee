@@ -196,10 +196,10 @@ async def _already_saved(
 
 
 async def _reply_duplicates(message: Message, duplicates: list[tuple[str, str]]) -> None:
-    lines = [f"♻️ <b>Already saved</b> · skipped {plural_files(len(duplicates))}"]
-    body = [f"{escape(name)} → <code>{escape(saved)}</code>" for name, saved in duplicates[:8]]
+    lines = [f"♻️ <b>Already saved</b> · <code>skipped {plural_files(len(duplicates))}</code>"]
+    body = [f"<i>{escape(name)}</i> → <code>{escape(saved)}</code>" for name, saved in duplicates[:8]]
     if len(duplicates) > 8:
-        body.append(f"… and {len(duplicates) - 8} more")
+        body.append(f"<i>… and {len(duplicates) - 8} more</i>")
     lines.append(f"<blockquote>{NEWLINE.join(body)}</blockquote>")
     await message.answer("\n".join(lines))
 
@@ -207,9 +207,9 @@ async def _reply_duplicates(message: Message, duplicates: list[tuple[str, str]])
 async def _reply_rejections(message: Message, rejections, partial: bool) -> None:
     header = "⚠️ <b>Skipped</b>" if partial else "⛔️ <b>Can't accept</b>"
     lines = [header]
-    body = [f"{escape(name)} — {escape(reason)}" for name, reason in rejections[:8]]
+    body = [f"<i>{escape(name)}</i> — {escape(reason)}" for name, reason in rejections[:8]]
     if len(rejections) > 8:
-        body.append(f"… and {len(rejections) - 8} more")
+        body.append(f"<i>… and {len(rejections) - 8} more</i>")
     lines.append(f"<blockquote>{NEWLINE.join(body)}</blockquote>")
     await message.answer("\n".join(lines))
 

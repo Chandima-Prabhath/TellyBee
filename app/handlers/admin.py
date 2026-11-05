@@ -48,22 +48,21 @@ async def stats_text(db: Database, manager: DownloadManager, settings: Settings)
 
     lines.append(
         "💾 <b>All-time</b>\n"
-        f"  <b>{totals['completed']}</b> {plural_files(totals['completed'])} saved · "
-        f"<b>{human_size(totals['total_bytes'])}</b>\n"
-        f"  {human_speed(totals['avg_speed'])} average · "
-        f"{totals['failed']} failed · {totals['cancelled']} cancelled"
+        f"<code>{totals['completed']} files · {human_size(totals['total_bytes'])} · "
+        f"{human_speed(totals['avg_speed'])} avg</code>\n"
+        f"<i>{totals['failed']} failed · {totals['cancelled']} cancelled</i>"
     )
 
     last24 = stats["last_24h"]
     lines.append(
-        f"\n⏱ <b>Last 24 hours</b>\n  {last24['count']} {plural_files(last24['count'])} · "
-        f"{human_size(last24['bytes'])}"
+        f"\n⏱ <b>Last 24 hours</b>\n<code>{last24['count']} {plural_files(last24['count'])} "
+        f"· {human_size(last24['bytes'])}</code>"
     )
 
     if stats["by_type"]:
         body = [
-            f"{type_icon(row['media_type'])} {row['media_type']} — "
-            f"<b>{row['count']}</b> · {human_size(row['bytes'])}"
+            f"{type_icon(row['media_type'])} <i>{row['media_type']}</i> — "
+            f"<code>{row['count']} · {human_size(row['bytes'])}</code>"
             for row in stats["by_type"][:8]
         ]
         newline = "\n"
@@ -73,16 +72,17 @@ async def stats_text(db: Database, manager: DownloadManager, settings: Settings)
         body = []
         for rank, row in enumerate(stats["top_users"], start=1):
             name = escape(str(row["name"]))
-            body.append(f"{rank}. {name} — {row['count']} · {human_size(row['bytes'])}")
+            body.append(f"{rank}. <i>{name}</i> — <code>{row['count']} · {human_size(row['bytes'])}</code>")
         newline = "\n"
-        lines.append(f"\n🏆 <b>Top savers</b>\n<blockquote>{newline.join(body)}</blockquote>")
+        opening = "blockquote expandable" if len(body) > 5 else "blockquote"
+        lines.append(f"\n🏆 <b>Top savers</b>\n<{opening}>{newline.join(body)}</{opening}>")
 
     snapshot = manager.snapshot()
     lines.append(
         "\n⚙️ <b>Now</b>\n"
-        f"  Workers <b>{snapshot.workers_busy}/{snapshot.workers_total}</b> · "
-        f"{len(snapshot.active)} active · {len(snapshot.pending)} pending"
-        + (" · <b>PAUSED</b>" if snapshot.paused else "")
+        f"<code>{snapshot.workers_busy}/{snapshot.workers_total} workers · "
+        f"{len(snapshot.active)} active · {len(snapshot.pending)} pending</code>"
+        + (" · <b>⏸ PAUSED</b>" if snapshot.paused else "")
     )
 
     # Disk reality check: a big file occupies roughly 2x its size across the
@@ -96,7 +96,7 @@ async def stats_text(db: Database, manager: DownloadManager, settings: Settings)
             usage = await asyncio.to_thread(shutil.disk_usage, str(target))
         except OSError:
             continue
-        disk_parts.append(f"{label} <b>{human_size(usage.free)}</b> free")
+        disk_parts.append(f"{label} <code>{human_size(usage.free)}</code> free")
     if disk_parts:
         lines.append("\n💾 <b>Disk</b>\n  " + " · ".join(disk_parts))
 

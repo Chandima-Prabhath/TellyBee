@@ -42,7 +42,14 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.config import Settings
 from app.queue.jobs import DownloadJob, JobStatus
-from app.utils.formatting import escape, fmt_eta, pct, plural_files, progress_bar
+from app.utils.formatting import (
+    escape,
+    fmt_eta,
+    pct,
+    plural_files,
+    progress_bar,
+    transfer_meta,
+)
 from app.utils.sizes import human_size, human_speed
 
 logger = logging.getLogger(__name__)
@@ -291,7 +298,12 @@ class Notifier:
                 if window.kick_at is not None:
                     if time.monotonic() >= window.kick_at:
                         await self._recreate(window)
-                    continue  # never edit a frame that is about to be replaced
+                        continue
+                    if window.message_id is None:
+                        continue  # nothing on screen yet — wait for the send
+                    # A replacement is scheduled but not due yet: keep the
+                    # current frame fresh instead of freezing it for the
+                    # whole park.
                 if window.live:
                     if window.message_id is not None and not window.broken:
                         await self._refresh(window)
@@ -304,20 +316,17 @@ class Notifier:
             return
 
     async def _recreate(self, window: _Window) -> None:
-        """Abort the previous window message and send a fresh one.
+        """Replace the window message: send the fresh frame, retire the old.
 
-        Delete-then-send: if the send fails, the worst case is "no window
-        for now" (the next intake re-kicks), never two competing frames.
+        Send-then-delete: the new frame lands at the bottom of the chat
+        (exactly where it belongs), and if the send hits a flood-wait the
+        OLD window is still on screen and keeps refreshing — the chat
+        never spends a second without a window. Two frames coexist only
+        for the duration of one delete call.
         """
         window.kick_at = None
         if window.broken or not window.live:
             return
-
-        old_id = window.message_id
-        if old_id is not None:
-            window.message_id = None
-            await self._delete_quietly(window.chat_id, old_id)
-            await self._db_drop(window.chat_id)
 
         text = self._window_text(window)
         try:
@@ -326,16 +335,21 @@ class Notifier:
             )
         except TelegramRetryAfter as err:
             # No sleeping the updater away: park the next attempt beyond
-            # the announced window (bounded) and try again then.
+            # the announced window (bounded) and try again then. The old
+            # frame (if any) stays on screen and stays fresh.
             window.kick_at = time.monotonic() + min(float(err.retry_after or 1), _WINDOW_FLOOD_PARK)
             return
         except Exception as err:  # noqa: BLE001 — chat may be unreachable
             logger.warning("cannot send progress window to chat %s: %s", window.chat_id, err)
             window.broken = True
             return
+
+        old_id = window.message_id
         window.message_id = message.message_id
         window._last_edit = time.monotonic()
         await self._db_upsert(window.chat_id, window.message_id)
+        if old_id is not None and old_id != message.message_id:
+            await self._delete_quietly(window.chat_id, old_id)
 
     async def _refresh(self, window: _Window) -> None:
         """Routine in-place edit of the window, paced and droppable.
@@ -533,14 +547,14 @@ class Notifier:
             chips.append(f"{window.failed} failed")
         if window.cancelled:
             chips.append(f"{window.cancelled} cancelled")
-        header = "🐝 <b>TellyBee</b>"
+        volume = sum((j.total_bytes or j.file_size or 0) for j in live)
+        if volume:
+            chips.append(human_size(volume))
+        header = "🐝 <b>TellyBee</b>  <i>downloads</i>"
         if self._manager is not None and getattr(self._manager, "paused", False):
             header += " · <b>⏸ paused</b>"
         if chips:
-            header += f"\n{' · '.join(chips)}"
-        volume = sum((j.total_bytes or j.file_size or 0) for j in live)
-        if volume:
-            header += f" · {human_size(volume)}"
+            header += f"\n<code>{' · '.join(chips)}</code>"
         lines: list[str] = [header]
         if active_entries or queued_jobs:
             lines.append(_DIVIDER)
@@ -559,14 +573,14 @@ class Notifier:
                 lines.append("")
             queued_bytes = sum((j.file_size or 0) for j in queued_jobs)
             size_part = f" · {human_size(queued_bytes)}" if queued_bytes else ""
-            names = " · ".join(
-                escape(_short(j.file_name or j.rel_path, 22)) for j in queued_jobs[:3]
-            )
-            hidden = len(queued_jobs) - 3
-            suffix = f" +{hidden}" if hidden > 0 else ""
-            lines.append(f"⏳ <b>Queued</b> · {plural_files(len(queued_jobs))}{size_part}")
+            lines.append(f"⏳ <b>Queued</b> · <code>{plural_files(len(queued_jobs))}{size_part}</code>")
+            names = [escape(_short(j.file_name or j.rel_path, 26)) for j in queued_jobs[:20]]
+            hidden = len(queued_jobs) - 20
+            if hidden > 0:
+                names.append(f"<i>… and {hidden} more</i>")
             if names:
-                lines.append(f"<blockquote>{names}{suffix}</blockquote>")
+                opening = "blockquote expandable" if len(names) > 3 else "blockquote"
+                lines.append(f"<{opening}>{chr(10).join(names)}</blockquote>")
         return "\n".join(lines)
 
     def _entry_lines(self, jobs: list[DownloadJob]) -> list[str]:
@@ -594,17 +608,10 @@ class Notifier:
             speed = sum(j.fetch_speed for j in waiting)
             if fetch_total and fetch_done:
                 frac = min(1.0, fetch_done / fetch_total)
-                lines.append(f"<code>{progress_bar(frac)} {pct(frac)}</code>")
-                meta = (
-                    f"{human_size(fetch_done)} / {human_size(fetch_total)} · {human_speed(speed)}"
-                )
-                if speed > 0 and frac < 1.0:
-                    meta += f" · ETA {fmt_eta((fetch_total - fetch_done) / speed)}"
-                lines.append(meta)
+                lines.append(f"<pre>{progress_bar(frac)} {pct(frac)}\n{transfer_meta(fetch_done, fetch_total, speed)}</pre>")
             else:
                 elapsed = max(time.monotonic() - j.waiting_since for j in waiting)
-                lines.append(f"<code>{progress_bar(0.0)} 0%</code>")
-                lines.append(f"⏳ Preparing · {fmt_eta(elapsed)}")
+                lines.append(f"<pre>{progress_bar(0.0)} 0%\n⏳ preparing · {fmt_eta(elapsed)}</pre>")
             return lines
 
         # Phase 2 — the transfer itself (cloud mode, or the fast local copy).
@@ -617,13 +624,9 @@ class Notifier:
             speed = sum(j.speed_bps for j in transferring)
             if total:
                 frac = min(1.0, done / total)
-                lines.append(f"<code>{progress_bar(frac)} {pct(frac)}</code>")
-                meta = f"{human_size(done)} / {human_size(total)} · {human_speed(speed)}"
-                if speed > 0 and frac < 1.0:
-                    meta += f" · ETA {fmt_eta((total - done) / speed)}"
-                lines.append(meta)
+                lines.append(f"<pre>{progress_bar(frac)} {pct(frac)}\n{transfer_meta(done, total, speed)}</pre>")
             else:
-                lines.append("⏬ Downloading…")
+                lines.append("<pre>⏬ downloading…</pre>")
         return lines
 
     def _receipt_text(self, group: _Group) -> str:
@@ -638,13 +641,13 @@ class Notifier:
         if completed and not failed and not cancelled:
             volume = human_size(total_bytes)
             if len(completed) > 1:
-                header = f"✅ <b>Saved {plural_files(len(completed))}</b> · {volume}"
+                header = f"✅ <b>Saved {plural_files(len(completed))}</b> · <code>{volume}</code>"
             else:
-                header = f"✅ <b>Saved</b> · {volume}"
+                header = f"✅ <b>Saved</b> · <code>{volume}</code>"
         elif completed:
-            header = f"✅ <b>Saved {len(completed)}/{len(results)}</b> · {human_size(total_bytes)}"
+            header = f"✅ <b>Saved {len(completed)}/{len(results)}</b> · <code>{human_size(total_bytes)}</code>"
         elif cancelled and not failed:
-            header = f"🚫 <b>Cancelled</b> · {plural_files(len(cancelled))}"
+            header = f"🚫 <b>Cancelled</b> · <code>{plural_files(len(cancelled))}</code>"
         else:
             header = "❌ <b>Download failed</b>"
         lines.append(header)
@@ -670,7 +673,7 @@ class Notifier:
             if speeds:
                 average = sum(speeds) / len(speeds)
                 suffix = " average" if len(completed) > 1 else ""
-                lines.append(f"⚡ <b>{human_speed(average)}</b>{suffix}")
+                lines.append(f"⚡ <code>{human_speed(average)}</code><i>{suffix}</i>")
 
         job_ids = " ".join(f"<code>#{j.job_id}</code>" for j in results[:5])
         directory = self._common_dir(completed) or (
@@ -689,10 +692,10 @@ class Notifier:
         icon = type_icon(job.media_type)
         name = escape(job.file_name or job.rel_path)
         if job.status is JobStatus.COMPLETED:
-            return f"{icon} {name} · {human_size(job.bytes_done or job.file_size)}"
+            return f"{icon} <i>{name}</i> · <code>{human_size(job.bytes_done or job.file_size)}</code>"
         if job.status is JobStatus.CANCELLED:
-            return f"🚫 {name} · cancelled"
-        return f"❌ {name} — {escape((job.error or 'error')[:80])}"
+            return f"🚫 <i>{name}</i> · cancelled"
+        return f"❌ <i>{name}</i> — {escape((job.error or 'error')[:80])}"
 
     @staticmethod
     def _common_dir(jobs: list[DownloadJob]) -> str | None:

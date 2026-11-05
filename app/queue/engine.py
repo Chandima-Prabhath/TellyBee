@@ -610,17 +610,29 @@ class DownloadEngine:
                 job.fetch_done = None
                 job.fetch_speed = 0.0
                 job.fetch_path = None
+                self._fetch_prev.pop(job.job_id, None)
                 continue
             size, _mtime, path = hit
+            streak = 0
             prev = self._fetch_prev.get(job.job_id)
             if prev is not None and now > prev[1]:
                 dt = now - prev[1]
                 inst = max(0.0, (size - prev[0]) / dt)
-                job.fetch_speed = (
-                    inst if job.fetch_speed <= 0
-                    else 0.7 * job.fetch_speed + 0.3 * inst
-                )
-            self._fetch_prev[job.job_id] = (size, now)
+                # A decaying EMA never quite reaches zero, which used to
+                # render a stalled fetch as "0 B/s · ETA 3512250h". After
+                # 3 consecutive no-growth polls the speed is forced to
+                # exactly 0.0 so the UI can say "stalled" and drop the
+                # nonsensical ETA; shorter hiccups keep decaying normally.
+                if size > prev[0]:
+                    job.fetch_speed = (
+                        inst if job.fetch_speed <= 0
+                        else 0.7 * job.fetch_speed + 0.3 * inst
+                    )
+                else:
+                    streak = (prev[2] if len(prev) > 2 else 0) + 1
+                    if streak >= 3:
+                        job.fetch_speed = 0.0
+            self._fetch_prev[job.job_id] = (size, now, streak)
             job.fetch_path = path
             job.fetch_total = job.file_size
             job.fetch_done = size

@@ -14,7 +14,14 @@ from app.queue.jobs import DownloadJob
 from app.queue.manager import DownloadManager
 from app.services.filenaming import UserRef, sanitize_segment
 from app.services.notifier import type_icon
-from app.utils.formatting import escape, fmt_eta, pct, plural_files, progress_bar
+from app.utils.formatting import (
+    escape,
+    fmt_eta,
+    pct,
+    plural_files,
+    progress_bar,
+    transfer_meta,
+)
 from app.utils.sizes import human_size, human_speed
 
 logger = logging.getLogger(__name__)
@@ -270,24 +277,23 @@ def _render_queue(snapshot) -> str:
         chips.append(f"{snapshot.failed} failed")
     if snapshot.cancelled:
         chips.append(f"{snapshot.cancelled} cancelled")
-    lines = ["🧮 <b>Download queue</b>", " · ".join(chips)]
+    lines = ["🧮 <b>Download queue</b>", f"<code>{' · '.join(chips)}</code>"]
     if snapshot.paused:
         lines.append("⏸ <b>Queue is paused</b> — running downloads finish, nothing new starts")
     lines.append(DIVIDER)
 
     if snapshot.active:
         lines.append("▶️ <b>Active</b>")
-        blocks = [_job_line(job) for job in snapshot.active[:8]]
-        opening = "blockquote expandable" if len(blocks) > 5 else "blockquote"
-        lines.append(f"<{opening}>{NEWLINE.join(blocks)}</{opening}>")
+        for job in snapshot.active[:8]:
+            lines.append(_job_line(job))
     if snapshot.pending:
         pending_bytes = sum(job.file_size or 0 for job in snapshot.pending)
         size_part = f" · {human_size(pending_bytes)}" if pending_bytes else ""
-        lines.append(f"⏳ <b>Pending</b> · {plural_files(len(snapshot.pending))}{size_part}")
+        lines.append(f"⏳ <b>Pending</b> · <code>{plural_files(len(snapshot.pending))}{size_part}</code>")
         entries = [_pending_line(job) for job in snapshot.pending[:10]]
         hidden = len(snapshot.pending) - 10
         if hidden > 0:
-            entries.append(f"… and {hidden} more")
+            entries.append(f"<i>… and {hidden} more</i>")
         opening = "blockquote expandable" if len(entries) > 5 else "blockquote"
         lines.append(f"<{opening}>{NEWLINE.join(entries)}</{opening}>")
     if not snapshot.active and not snapshot.pending:
@@ -296,7 +302,7 @@ def _render_queue(snapshot) -> str:
 
 
 def _job_line(job: DownloadJob) -> str:
-    """One active job as a two-line block: name + bar/meta.
+    """One active job: bold name over a monospace progress card.
 
     The server-side fetch phase of local Bot API mode renders exactly like
     the transfer phase — users just see download progress.
@@ -304,31 +310,22 @@ def _job_line(job: DownloadJob) -> str:
     name = escape(job.file_name or job.rel_path)
     if job.waiting_since is not None and job.fetch_total:
         frac = job.fetch_fraction
-        meta = (
-            f"{human_size(job.fetch_done or 0)} / {human_size(job.fetch_total)} "
-            f"· {human_speed(job.fetch_speed)}"
-        )
-        if job.fetch_speed > 0 and frac is not None and frac < 1.0:
-            meta += f" · ETA {fmt_eta(job.fetch_eta_seconds)}"
+        meta = transfer_meta(job.fetch_done or 0, job.fetch_total, job.fetch_speed)
     else:
         frac = job.progress_fraction
-        meta = (
-            f"{human_size(job.bytes_done)} / "
-            f"{human_size(job.total_bytes or job.file_size)} · "
-            f"{human_speed(job.speed_bps)}"
+        meta = transfer_meta(
+            job.bytes_done, job.total_bytes or job.file_size or 0, job.speed_bps
         )
-        if job.speed_bps > 0 and frac is not None and frac < 1.0:
-            meta += f" · ETA {fmt_eta(job.eta_seconds)}"
     bar = progress_bar(frac)
     percent = pct(frac)
-    return f"{type_icon(job.media_type)} <b>{name}</b>\n<code>{bar} {percent}</code> · {meta}"
+    return f"{type_icon(job.media_type)} <b>{name}</b>\n<pre>{bar} {percent}\n{meta}</pre>"
 
 
 def _pending_line(job: DownloadJob) -> str:
     name = escape(job.file_name or job.rel_path)
     size = human_size(job.file_size) if job.file_size else ""
-    size_part = f" · {size}" if size else ""
-    return f"{type_icon(job.media_type)} {name}{size_part}"
+    size_part = f" · <code>{size}</code>" if size else ""
+    return f"{type_icon(job.media_type)} <i>{name}</i>{size_part}"
 
 
 # ── /cancel ─────────────────────────────────────────────────────────────────

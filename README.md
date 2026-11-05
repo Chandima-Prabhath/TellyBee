@@ -38,7 +38,15 @@ Built on **aiogram 3** (fully async), **Python 3.12**, and a
   admin-only, users cancel their own files).
 - 📌 **The window stays pinned to the bottom** — every receipt or button
   reply re-anchors it as the newest message in the chat, so live progress
-  never drifts out of view while a long queue runs.
+  never drifts out of view while a long queue runs. Re-anchoring is
+  **send-before-delete**: even when Telegram rate-limits the resend, the
+  chat never spends a second without its window.
+- 💎 **Modern Telegram rendering** — monospace figure chips (`<code>`),
+  progress cards (`<pre>`), expandable blockquotes for long lists, bold
+  headers and italic filenames: a dashboard look, not plain text.
+- 🐢 **Forwards are never dropped** — the per-user throttle only guards
+  text/command spam; media always reaches the queue, so forwarding an
+  entire series in one go just works.
 - 🗂 **Per-user folder layout** — `/folder` switches between organized
   template folders and **one flat folder** (`/folder Show Name` gives a
   series its own folder so episodes forwarded across days stay together).
@@ -51,8 +59,10 @@ Built on **aiogram 3** (fully async), **Python 3.12**, and a
 - 🗂 **Flexible storage layout** — a configurable folder template like
   `{user}/{type}/{date}` with path-safety sanitization and collision-proof
   naming, plus each user's own `/folder` override.
-- 🚦 **Flood-safe** — per-user throttling, bounded queue, file-type filters,
-  size limits with friendly rejections.
+- 🚦 **Flood-safe & honest** — per-user throttling (media exempt), bounded
+  queue, file-type filters, size limits with friendly rejections, and
+  progress that says what it means: a true stall renders as `⏸ stalled`,
+  never a fantastical multi-year ETA.
 - ❤️ **Ops-friendly** — HTTP `/healthz` endpoint with queue metrics
   (docker healthcheck built in), text or JSON logs, polling *or* webhook
   mode, optional local Bot API server support for **files up to 4 GB**.
