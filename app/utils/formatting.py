@@ -21,6 +21,8 @@ def transfer_meta(done: float, total: float, speed: float) -> str:
     "ETA 3512250h" — so slow trickles keep the byte counters and drop
     the ETA instead of lying with one.
     """
+    if total > 0 and done >= total:
+        return f"{human_size(done)} / {human_size(total)} · ✔ finishing"
     if speed <= 0:
         return f"{human_size(done)} / {human_size(total)} · ⏸ stalled"
     meta = f"{human_size(done)} / {human_size(total)} · {human_speed(speed)}"

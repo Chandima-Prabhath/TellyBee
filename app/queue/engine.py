@@ -165,6 +165,10 @@ class DownloadEngine:
         self._watching: dict[str, DownloadJob] = {}
         # job_id → (last observed server-side size, monotonic time), for speed
         self._fetch_prev: dict[str, tuple[int, float]] = {}
+        # path → size at the previous volume scan; lets the matcher tell a
+        # file that is still growing (a live fetch) from a leftover complete
+        # entry (a finished job's cache file that never grows again).
+        self._scan_prev: dict[str, int] = {}
         self._watcher_task: asyncio.Task | None = None
         # ONE bound for ALL concurrent server-side fetches — workers and
         # prefetch take slots from the same semaphore. Cloud mode needs no
@@ -521,12 +525,16 @@ class DownloadEngine:
         interval = max(0.2, self._settings.fetch_watch_interval)
         while True:
             await asyncio.sleep(interval)
-            jobs = [job for job in self._watching.values() if job.file_size]
-            if not jobs:
-                continue
+            # The scan runs even when nothing is waiting: keeping the
+            # previous-size map fresh across idle gaps means a leftover
+            # file that finished while nobody watched is correctly seen
+            # as not-growing on the next busy scan.
             try:
                 candidates = await asyncio.to_thread(self._scan_server_files)
             except OSError:
+                continue
+            jobs = [job for job in self._watching.values() if job.file_size]
+            if not jobs:
                 continue
             if not candidates:
                 for job in jobs:
@@ -535,18 +543,22 @@ class DownloadEngine:
                 continue
             self._match_fetch_progress(jobs, candidates)
 
-    def _scan_server_files(self) -> list[tuple[int, float, str]]:
+    def _scan_server_files(self) -> list[tuple[int, float, str, bool]]:
         """Snapshot of recently-modified files in the server's storage.
 
-        Returns ``(size, mtime, path)`` tuples for files modified within
-        ``_FETCH_SCAN_MAX_AGE``. Blocking (stat storm) — always call via
+        Returns ``(size, mtime, path, grew)`` tuples for files modified
+        within ``_FETCH_SCAN_MAX_AGE``; ``grew`` is True when the file is
+        new since the previous scan or larger than then — i.e. a live
+        download in progress. Blocking (stat storm) — always call via
         ``asyncio.to_thread``. Paths are internal and must never be logged.
         """
         root = Path(self.LOCAL_FILES_DIR) / (getattr(self._bot, "token", "") or "")
         if not root.is_dir():
             return []
         now = time.time()
-        results: list[tuple[int, float, str]] = []
+        prev_sizes = self._scan_prev
+        fresh: dict[str, int] = {}
+        results: list[tuple[int, float, str, bool]] = []
         for dirpath, _dirs, files in os.walk(root):
             depth = dirpath[len(str(root)) :].count(os.sep)
             if depth >= 4:
@@ -561,22 +573,32 @@ class DownloadEngine:
                     continue
                 if st.st_mtime < now - _FETCH_SCAN_MAX_AGE:
                     continue
-                results.append((st.st_size, st.st_mtime, path))
+                grew = path not in prev_sizes or st.st_size > prev_sizes[path]
+                fresh[path] = st.st_size
+                results.append((st.st_size, st.st_mtime, path, grew))
+        # Replace wholesale so deleted cache entries drop out of the map.
+        self._scan_prev = fresh
         return results
 
     def _match_fetch_progress(
-        self, jobs: list[DownloadJob], candidates: list[tuple[int, float, str]]
+        self, jobs: list[DownloadJob], candidates: list[tuple[int, float, str, bool]]
     ) -> None:
-        """Pair growing server-side files with waiting jobs by expected size.
+        """Pair live server-side files with waiting jobs by expected size.
 
-        Sticky first (a job keeps its matched file while it still fits), then
-        largest-expected-first greedy matching for the rest. Sizes above the
-        expected size (plus tolerance) can never be the job's file still
-        downloading — those are already-complete cache entries.
+        Sticky first (a job keeps its matched file while it still fits —
+        including its completed tail, the honest 100% before getFile
+        returns), then largest-expected-first greedy matching for the
+        rest. Fresh matches only consider files that GREW since the
+        previous scan: a leftover complete entry from an earlier job fits
+        the size window too and is bigger, but it never grows — matching
+        it once showed a new episode frozen at the previous file's size
+        and "stalled". Complete-but-not-growing entries are therefore
+        invisible to fresh matching; a file that finishes between two
+        scans still qualifies (new since the last scan).
         """
         now = time.monotonic()
         used: set[str] = set()
-        matched: dict[str, tuple[int, float, str]] = {}
+        matched: dict[str, tuple[int, float, str, bool]] = {}
         # Pass 1: sticky rematching — keeps the display stable.
         for job in sorted(jobs, key=lambda j: -(j.file_size or 0)):
             path = job.fetch_path
@@ -590,17 +612,18 @@ class DownloadEngine:
             ):
                 matched[job.job_id] = hit
                 used.add(hit[2])
-        # Pass 2: fresh matches — biggest expected size picks first.
+        # Pass 2: fresh matches — biggest expected size picks first,
+        # among files that are actually downloading (grew since last scan).
         for job in sorted(jobs, key=lambda j: -(j.file_size or 0)):
             if job.job_id in matched:
                 continue
             expected = job.file_size or 0
-            best: tuple[int, float, str] | None = None
-            for size, _mtime, path in candidates:
-                if path in used or size > expected + _FETCH_SIZE_TOLERANCE:
+            best: tuple[int, float, str, bool] | None = None
+            for size, _mtime, path, grew in candidates:
+                if not grew or path in used or size > expected + _FETCH_SIZE_TOLERANCE:
                     continue
                 if best is None or size > best[0]:
-                    best = (size, _mtime, path)
+                    best = (size, _mtime, path, grew)
             if best is not None:
                 matched[job.job_id] = best
                 used.add(best[2])
@@ -612,7 +635,7 @@ class DownloadEngine:
                 job.fetch_path = None
                 self._fetch_prev.pop(job.job_id, None)
                 continue
-            size, _mtime, path = hit
+            size, _mtime, path, _grew = hit
             streak = 0
             prev = self._fetch_prev.get(job.job_id)
             if prev is not None and now > prev[1]:

@@ -63,6 +63,11 @@ Built on **aiogram 3** (fully async), **Python 3.12**, and a
   queue, file-type filters, size limits with friendly rejections, and
   progress that says what it means: a true stall renders as `⏸ stalled`,
   never a fantastical multi-year ETA.
+- 🎯 **Progress tracks the right file** — fetch-progress matching only
+  pairs a job with a server-side file that is actually *growing*; a
+  leftover complete cache entry from an earlier download can never masquerade
+  as the current one (once froze a new episode at the previous file's size,
+  "stalled"). A fully-downloaded file awaiting its copy shows `✔ finishing`.
 - ❤️ **Ops-friendly** — HTTP `/healthz` endpoint with queue metrics
   (docker healthcheck built in), text or JSON logs, polling *or* webhook
   mode, optional local Bot API server support for **files up to 4 GB**.
