@@ -100,6 +100,11 @@ class DownloadManager:
             asyncio.create_task(self._worker(i), name=f"tellybee-worker-{i}")
             for i in range(self._settings.download_concurrency)
         ]
+        # Idle-time engine services (the botapi cache sweeper) — starts even
+        # before the first job so leftovers of previous runs get cleaned.
+        background = getattr(self._engine, "start_background", None)
+        if callable(background):
+            background()
         logger.info("download manager started with %d workers", len(self._workers))
 
     async def shutdown(self, timeout: float = 25.0) -> None:  # noqa: ASYNC109 — public kwarg, kept for API stability

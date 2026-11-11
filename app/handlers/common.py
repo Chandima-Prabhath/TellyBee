@@ -16,13 +16,12 @@ from app.services.filenaming import UserRef, sanitize_segment
 from app.services.notifier import type_icon
 from app.utils.formatting import (
     escape,
-    fmt_eta,
     pct,
     plural_files,
     progress_bar,
     transfer_meta,
 )
-from app.utils.sizes import human_size, human_speed
+from app.utils.sizes import human_size
 
 logger = logging.getLogger(__name__)
 
@@ -289,7 +288,10 @@ def _render_queue(snapshot) -> str:
     if snapshot.pending:
         pending_bytes = sum(job.file_size or 0 for job in snapshot.pending)
         size_part = f" · {human_size(pending_bytes)}" if pending_bytes else ""
-        lines.append(f"⏳ <b>Pending</b> · <code>{plural_files(len(snapshot.pending))}{size_part}</code>")
+        lines.append(
+            f"⏳ <b>Pending</b> · "
+            f"<code>{plural_files(len(snapshot.pending))}{size_part}</code>"
+        )
         entries = [_pending_line(job) for job in snapshot.pending[:10]]
         hidden = len(snapshot.pending) - 10
         if hidden > 0:

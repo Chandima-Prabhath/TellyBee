@@ -1,3 +1,3 @@
 """TellyBee — a modern, fast and stable Telegram file/media downloader bot."""
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"

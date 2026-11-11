@@ -172,6 +172,25 @@ class Settings(BaseSettings):
     # How often (seconds) the engine polls the server's shared volume to
     # estimate live fetch progress for waiting jobs.
     fetch_watch_interval: float = 1.5
+    # Seconds of zero server-side fetch progress before the parked getFile
+    # call is cancelled and re-issued. A re-ask is free — the server keeps
+    # its download progress and the new query attaches to the same fetch —
+    # so a stalled file recovers in FETCH_STALL_TIMEOUT instead of idling
+    # until GETFILE_TIMEOUT (default 30 min) or 24h budget expires.
+    # 0 disables the stall poke.
+    fetch_stall_timeout: float = 90.0
+
+    # ── Local Bot API cache housekeeping ────────────────────────────────
+    # The local Bot API server keeps every downloaded file (guaranteed ~1h,
+    # up to ~25h — retention NOT configurable, per the maintainers in
+    # tdlib/telegram-bot-api#303) even after the bot has copied it to
+    # ./downloads, so the botapi-data volume slowly fills a small disk.
+    # TellyBee cleans it itself (needs the volume mounted read-write):
+    # each copied file's server-side copy is deleted immediately, and a
+    # sweeper removes leftovers older than the TTL below.
+    botapi_evict_after_copy: bool = True
+    botapi_cache_ttl_minutes: float = 120.0
+    botapi_cleanup_interval_minutes: float = 15.0
 
     # ── Direct link downloads (/link + URLs in messages) ─────────────────
     links_enabled: bool = True
@@ -330,6 +349,18 @@ class Settings(BaseSettings):
             raise ValueError(
                 "FETCH_WATCH_INTERVAL must be between 0.2 and 30 seconds"
             )
+        if not 0 <= self.fetch_stall_timeout <= 3600.0:
+            raise ValueError(
+                "FETCH_STALL_TIMEOUT must be between 0 (off) and 3600 seconds"
+            )
+        if self.botapi_cache_ttl_minutes < 0:
+            raise ValueError(
+                "BOTAPI_CACHE_TTL_MINUTES cannot be negative (0 = no sweeping)"
+            )
+        if not 1 <= self.botapi_cleanup_interval_minutes <= 1440:
+            raise ValueError(
+                "BOTAPI_CLEANUP_INTERVAL_MINUTES must be between 1 and 1440"
+            )
         if not 1 <= self.link_connections <= 16:
             raise ValueError("LINK_CONNECTIONS must be between 1 and 16")
         if self.link_max_size < 0:
@@ -399,5 +430,7 @@ class Settings(BaseSettings):
             f"admins={len(self.admin_ids)} allowed={len(self.allowed_user_ids)} "
             f"open_access={self.open_access} "
             f"prefetch={self.prefetch} fetches={self.fetch_concurrency} "
+            f"stall_poke={self.fetch_stall_timeout:g}s "
+            f"cache_ttl={self.botapi_cache_ttl_minutes:g}min "
             f"links={self.links_enabled} ssrf={self.link_ssrf_guard}"
         )

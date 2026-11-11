@@ -20,12 +20,15 @@ Two transport modes:
   *absolute path* inside the server's own storage, and the server has **no
   HTTP file endpoint at all** (any ``/file/...`` request is answered with
   404). The server's data directory must therefore be shared with this
-  container (read-only mount suffices) and we stream-copy the file straight
-  from disk, which is also much faster than going through HTTP. Because
-  the server writes every file with owner-only permissions (TDLib creates
-  them ``0600``) as its *own* user, it must run under the same uid as this
-  bot — the compose example wires that up — otherwise every read fails
-  with ``PermissionError``.
+  container and we stream-copy the file straight from disk, which is also
+  much faster than going through HTTP. Because the server writes every
+  file with owner-only permissions (TDLib creates them ``0600``) as its
+  *own* user, it must run under the same uid as this bot — the compose
+  example wires that up — otherwise every read fails with
+  ``PermissionError``. The mount must be read-write (v0.7+) so the cache
+  cleaner can delete served files after copying them: the server's own
+  retention (1–25 h) is not configurable and otherwise slowly fills
+  small disks — see :mod:`app.services.botapi_cache`.
 
 Local-mode performance pipeline (v0.3+):
 
@@ -45,7 +48,14 @@ Local-mode performance pipeline (v0.3+):
 * **Fetch progress** — while ``getFile`` is parked, a watcher polls the
   server's shared storage for growing files and maps them to waiting jobs
   by expected size, so the chat shows real % / speed / ETA during the
-  otherwise opaque "preparing" phase.
+  otherwise opaque "preparing" phase. A fetch that shows *zero* progress
+  for ``FETCH_STALL_TIMEOUT`` (default 90 s) gets its parked getFile call
+  cancelled and re-issued — the server keeps its download progress, so a
+  stall costs seconds instead of the whole ``GETFILE_TIMEOUT`` wait.
+* **Cache housekeeping** — the server keeps fetched files for 1–25 h on
+  its own; the bot deletes each copy as soon as the file is safely in
+  ``./downloads`` and sweeps stale leftovers (see
+  :mod:`app.services.botapi_cache`).
 * **Direct links** — jobs with ``media_type == "url"`` bypass Telegram
   entirely and are fetched by :class:`~app.services.urlfetch.UrlDownloader`
   (parallel ranged connections, SSRF-guarded).
@@ -72,6 +82,7 @@ from aiogram.exceptions import TelegramNetworkError
 from app.config import Settings
 from app.queue.errors import DownloadError, EngineResult, JobCancelled
 from app.queue.jobs import DownloadJob, JobStatus
+from app.services.botapi_cache import BotApiCacheCleaner
 from app.services.urlfetch import (
     UrlDownloader,
     UrlRejected,
@@ -126,6 +137,16 @@ class _FileCache:
     def put(self, file_id: str, path: str) -> None:
         self._entries[file_id] = (path, time.monotonic() + self._ttl)
 
+    def invalidate(self, file_id: str) -> None:
+        """Forget a mapping — the server-side file was deleted."""
+        self._entries.pop(file_id, None)
+
+    def active_paths(self) -> set[str]:
+        """Paths whose mapping is still valid (the sweeper's "hands off"
+        set — a live mapping may be needed again by a later waiter)."""
+        now = time.monotonic()
+        return {path for path, expires in self._entries.values() if now < expires}
+
 
 class DownloadEngine:
     """Executes single download jobs on behalf of the queue workers."""
@@ -133,10 +154,9 @@ class DownloadEngine:
     #: Where the local Bot API server keeps received files. In ``--local``
     #: mode ``getFile`` returns absolute paths inside this directory and the
     #: server exposes no HTTP file endpoint — the directory must be shared
-    #: with this container (read-only mount suffices, we only ever read).
-    #: The server writes files with owner-only permissions as its own user,
-    #: so it must run under the SAME uid as this bot (1000); the compose
-    #: example's botapi entrypoint arranges exactly that.
+    #: with this container. Reading needs the server to run under the SAME
+    #: uid as this bot (1000); since v0.7 the mount must be read-write so
+    #: the cache cleaner can delete served files after copying them.
     #: See the ``botapi-data`` volume in docker-compose.yml.example.
     LOCAL_FILES_DIR = Path("/var/lib/telegram-bot-api")
 
@@ -163,12 +183,21 @@ class DownloadEngine:
         self._fetch_started: dict[str, float] = {}
         # job_id → job while it waits for the server-side fetch (watcher input)
         self._watching: dict[str, DownloadJob] = {}
-        # job_id → (last observed server-side size, monotonic time), for speed
-        self._fetch_prev: dict[str, tuple[int, float]] = {}
+        # job_id → (last observed server-side size, monotonic time, no-growth
+        # streak), for speed/stall tracking
+        self._fetch_prev: dict[str, tuple[int, float, int]] = {}
         # path → size at the previous volume scan; lets the matcher tell a
         # file that is still growing (a live fetch) from a leftover complete
         # entry (a finished job's cache file that never grows again).
         self._scan_prev: dict[str, int] = {}
+        # file_id → monotonic time when its server-side fetch last showed
+        # ZERO growth (armed by the watcher; disarmed on any growth). The
+        # parked getFile call is cancelled and re-issued once that age
+        # passes FETCH_STALL_TIMEOUT — see _poke_stalled_fetch.
+        self._stall_since: dict[str, float] = {}
+        # file_id → the currently-parked getFile HTTP call (a child task of
+        # the shared fetch task, cancellable for stall pokes / shutdown).
+        self._getfile_calls: dict[str, asyncio.Task] = {}
         self._watcher_task: asyncio.Task | None = None
         # ONE bound for ALL concurrent server-side fetches — workers and
         # prefetch take slots from the same semaphore. Cloud mode needs no
@@ -179,7 +208,17 @@ class DownloadEngine:
             else None
         )
         self._url = UrlDownloader(settings) if settings.links_enabled else None
+        # ── local-mode cache housekeeping (v0.7) ────────────────────────
+        self._cleaner: BotApiCacheCleaner | None = None
+        self._cleaner_task: asyncio.Task | None = None
         if self._local_mode:
+            self._cleaner = BotApiCacheCleaner(
+                self.LOCAL_FILES_DIR / (getattr(bot, "token", "") or ""),
+                ttl_seconds=settings.botapi_cache_ttl_minutes * 60.0,
+                interval_seconds=settings.botapi_cleanup_interval_minutes * 60.0,
+                evict_after_copy=settings.botapi_evict_after_copy,
+                protected=self._protected_cache_paths,
+            )
             if self.LOCAL_FILES_DIR.is_dir():
                 logger.info(
                     "local Bot API mode: files are read straight from %s — the "
@@ -191,8 +230,9 @@ class DownloadEngine:
                 logger.warning(
                     "local Bot API mode, but %s is not mounted in this container — "
                     "downloads WILL fail. Share the botapi data volume with the "
-                    "tellybee service: add 'botapi-data:/var/lib/telegram-bot-api:ro' "
-                    "to its volumes in docker-compose.yml, then recreate with "
+                    "tellybee service: add 'botapi-data:/var/lib/telegram-bot-api' "
+                    "(read-write, so the cache cleaner can work) to its volumes "
+                    "in docker-compose.yml, then recreate with "
                     "docker compose up -d --build",
                     self.LOCAL_FILES_DIR,
                 )
@@ -214,14 +254,62 @@ class DownloadEngine:
         if self._inflight:
             await asyncio.gather(*self._inflight.values(), return_exceptions=True)
             self._inflight.clear()
+        # The inflight fetch tasks cancel their own child calls, but a task
+        # may die before its child even started — cancel what is left.
+        for call in list(self._getfile_calls.values()):
+            call.cancel()
+        if self._getfile_calls:
+            await asyncio.gather(*self._getfile_calls.values(), return_exceptions=True)
+            self._getfile_calls.clear()
         if self._watcher_task and not self._watcher_task.done():
             self._watcher_task.cancel()
             with contextlib.suppress(Exception):
                 await asyncio.gather(self._watcher_task, return_exceptions=True)
+        if self._cleaner_task and not self._cleaner_task.done():
+            self._cleaner_task.cancel()
+            with contextlib.suppress(Exception):
+                await asyncio.gather(self._cleaner_task, return_exceptions=True)
         if self._url is not None:
             await self._url.aclose()
         if self._http and not self._http.closed:
             await self._http.close()
+
+    # ── background services (local mode) ─────────────────────────────────
+
+    def start_background(self) -> None:
+        """Start the idle-time background services — the cache sweeper.
+
+        Called once the event loop is up (``DownloadManager.start``) so a
+        fresh boot sweeps leftovers of *previous* runs right away, before
+        any new job arrives and even if none ever does.
+        """
+        if self._cleaner is None:
+            return
+        if self._cleaner_task is None or self._cleaner_task.done():
+            self._cleaner_task = asyncio.create_task(
+                self._cleaner.run(), name="tellybee-botapi-cache-sweeper"
+            )
+            logger.info(
+                "botapi cache sweeper started: deletes copied files immediately "
+                "(%s) and sweeps stale entries every %s (TTL %s)",
+                "on" if self._cleaner.evict_after_copy else "off",
+                f"{self._settings.botapi_cleanup_interval_minutes:g} min",
+                f"{self._settings.botapi_cache_ttl_minutes:g} min",
+            )
+
+    def _protected_cache_paths(self) -> set[str]:
+        """Server-cache paths a sweep must not touch right now.
+
+        In-flight watcher matches (a job's file is still downloading) and
+        still-valid file_id→path mappings (a waiter may still need the
+        file) are protected; everything else in the ``files/`` subtree is
+        fair game once old enough.
+        """
+        paths = self._cache.active_paths()
+        for job in self._watching.values():
+            if job.fetch_path:
+                paths.add(job.fetch_path)
+        return paths
 
     # ── URL helpers ─────────────────────────────────────────────────────────
 
@@ -310,6 +398,10 @@ class DownloadEngine:
         if not path:
             raise DownloadError("getFile returned an empty file_path")
         self._cache.put(file_id, path)
+        if self._cleaner is not None:
+            # Teach the sweeper where the files/ subtree lives (if this
+            # path uses the expected layout).
+            self._cleaner.observe(path)
         return path
 
     async def _fetch_task(self, file_id: str) -> asyncio.Task:
@@ -340,13 +432,17 @@ class DownloadEngine:
         return task
 
     async def _fetch_with_reissue(self, file_id: str):
-        """getFile, re-issuing on client-side timeouts (local mode only).
+        """getFile, re-issuing on client-side timeouts AND stall pokes.
 
         Cloud getFile is a quick metadata call → session default (60s), no
         re-issues. Local getFile blocks for the whole server-side download →
         allow minutes per call (``GETFILE_TIMEOUT``), and when the call times
         out just ask again — the server attaches the new query to the SAME
-        in-flight download and answers it on completion.
+        in-flight download and answers it on completion. A *stalled* fetch
+        (zero growth on the shared volume for ``FETCH_STALL_TIMEOUT``) is
+        poked the same way — cancelling the parked call and re-asking —
+        instead of idling until ``GETFILE_TIMEOUT`` burns down; see
+        ``_poke_stalled_fetch``.
 
         In local mode the whole wait holds one ``FETCH_CONCURRENCY`` slot:
         the server-side fetch IS the scarce resource, and workers must
@@ -371,10 +467,35 @@ class DownloadEngine:
                 request_timeout = (
                     round(self._settings.getfile_timeout) if self._local_mode else None
                 )
+                # A child task, not a bare await: a stall poke (or shutdown)
+                # cancels the parked HTTP call without killing this shared
+                # fetch task for its other waiters.
+                call = asyncio.create_task(
+                    self._bot.get_file(file_id, request_timeout=request_timeout)
+                )
+                self._getfile_calls[file_id] = call
+                poked = False
                 try:
-                    file = await self._bot.get_file(
-                        file_id, request_timeout=request_timeout
-                    )
+                    while not call.done():
+                        await asyncio.wait({call}, timeout=_GETFILE_CANCEL_POLL)
+                        if not call.done() and self._poke_stalled_fetch(file_id):
+                            poked = True
+                            call.cancel()
+                    if poked:
+                        # Swallow the child's cancellation; the loop re-asks
+                        # at once — the server keeps its download progress.
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await call
+                        continue
+                    file = call.result()
+                except asyncio.CancelledError:
+                    # This shared task itself was cancelled (shutdown): the
+                    # parked child call is not auto-cancelled while awaited,
+                    # so cancel it explicitly before propagating.
+                    call.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await call
+                    raise
                 except TelegramNetworkError as err:
                     timed_out = "timeout" in str(err).lower()
                     if (
@@ -396,10 +517,41 @@ class DownloadEngine:
                     if file.file_path:
                         self._cache.put(file_id, file.file_path)
                     return file
+                finally:
+                    if self._getfile_calls.get(file_id) is call:
+                        self._getfile_calls.pop(file_id, None)
         finally:
             if sem is not None:
                 sem.release()
             self._fetch_started.pop(file_id, None)
+            self._stall_since.pop(file_id, None)
+
+    def _poke_stalled_fetch(self, file_id: str) -> bool:
+        """True when the parked getFile call should be re-asked right now.
+
+        The watcher arms ``_stall_since`` whenever a matched fetch shows no
+        growth at all (its speed is forced to exactly 0 after 3 polls).
+        Once that state has lasted ``FETCH_STALL_TIMEOUT``, the parked HTTP
+        call is cancelled and re-issued: the server keeps its download
+        progress and the new query attaches to the same fetch, so this is
+        free — and it turns a silent hang into a ~90 s hiccup whenever the
+        stall was a lost answer or a wedged client connection rather than
+        the Telegram transfer itself. 0 disables the poke entirely.
+        """
+        timeout = getattr(self._settings, "fetch_stall_timeout", 0.0) or 0.0
+        if not self._local_mode or timeout <= 0:
+            return False
+        since = self._stall_since.get(file_id)
+        if since is None or time.monotonic() - since < timeout:
+            return False
+        self._stall_since[file_id] = time.monotonic()  # re-arm the window
+        logger.info(
+            "getFile for file %s has had zero fetch progress for %.0fs — "
+            "re-asking now (the server keeps its download progress)",
+            file_id[:12],
+            timeout,
+        )
+        return True
 
     async def _race_cancel(
         self, task: asyncio.Task, job: DownloadJob | None
@@ -659,6 +811,13 @@ class DownloadEngine:
             job.fetch_path = path
             job.fetch_total = job.file_size
             job.fetch_done = size
+            # Stall-poke bookkeeping (see _poke_stalled_fetch): armed while
+            # the matched file shows neither growth nor completion.
+            total = job.fetch_total or job.file_size
+            if total and size < total and job.fetch_speed <= 0:
+                self._stall_since.setdefault(job.file_id, now)
+            else:
+                self._stall_since.pop(job.file_id, None)
 
     # ── main entrypoint ─────────────────────────────────────────────────────
 
@@ -719,8 +878,8 @@ class DownloadEngine:
         if self._local_mode and file_path.startswith("/"):
             # Local Bot API server: getFile returns an absolute path inside
             # the server's storage and there is no HTTP file endpoint —
-            # stream-copy the file from the (read-only) shared volume. Works
-            # only when the server runs as the same uid as this process.
+            # stream-copy the file from the shared volume. Works only when
+            # the server runs as the same uid as this process.
             return await self._copy_local_file(job, file_path, started)
         url = self.file_url(file_path)
         session = await self._session()
@@ -830,8 +989,9 @@ class DownloadEngine:
                 raise DownloadError(
                     f"{self.LOCAL_FILES_DIR} is not mounted in this container, but the "
                     f"local Bot API server stores files there — add "
-                    f"'botapi-data:/var/lib/telegram-bot-api:ro' to the tellybee "
-                    f"service volumes in docker-compose.yml and recreate the container"
+                    f"'botapi-data:/var/lib/telegram-bot-api' (read-write) to the "
+                    f"tellybee service volumes in docker-compose.yml and recreate "
+                    f"the container"
                 ) from None
             # The server can still be flushing a large file to disk; let the
             # normal retry/backoff machinery handle that (FileNotFoundError
@@ -878,7 +1038,25 @@ class DownloadEngine:
             part_file.unlink(missing_ok=True)
             raise
 
+        # Hand the server's copy back: the file is safely in ./downloads
+        # now, and the local server's own retention (1–25 h) is not
+        # configurable — see app.services.botapi_cache.
+        self._evict_server_copy(job, server_path)
+
         return self._finish(job, started, digest, bytes_written)
+
+    def _evict_server_copy(self, job: DownloadJob, server_path: str) -> None:
+        """Delete the served file from the server's cache once it is copied.
+
+        Also drops the file_id→path mapping: the path is about to vanish, so
+        a later waiter (re-send, re-queue) must re-ask the server instead of
+        receiving a ghost path whose copy would keep failing.
+        """
+        cleaner = self._cleaner
+        if cleaner is None or not cleaner.evict_after_copy:
+            return
+        self._cache.invalidate(job.file_id)
+        cleaner.evict_now(server_path, reason="copied to downloads")
 
     @staticmethod
     def _finish(

@@ -47,6 +47,7 @@ def _engine() -> DownloadEngine:
     engine._scan_prev = {}
     engine._fetch_prev = {}
     engine._fetch_started = {}
+    engine._stall_since = {}
     return engine
 
 

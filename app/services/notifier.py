@@ -573,7 +573,10 @@ class Notifier:
                 lines.append("")
             queued_bytes = sum((j.file_size or 0) for j in queued_jobs)
             size_part = f" · {human_size(queued_bytes)}" if queued_bytes else ""
-            lines.append(f"⏳ <b>Queued</b> · <code>{plural_files(len(queued_jobs))}{size_part}</code>")
+            lines.append(
+                f"⏳ <b>Queued</b> · "
+                f"<code>{plural_files(len(queued_jobs))}{size_part}</code>"
+            )
             names = [escape(_short(j.file_name or j.rel_path, 26)) for j in queued_jobs[:20]]
             hidden = len(queued_jobs) - 20
             if hidden > 0:
@@ -608,10 +611,16 @@ class Notifier:
             speed = sum(j.fetch_speed for j in waiting)
             if fetch_total and fetch_done:
                 frac = min(1.0, fetch_done / fetch_total)
-                lines.append(f"<pre>{progress_bar(frac)} {pct(frac)}\n{transfer_meta(fetch_done, fetch_total, speed)}</pre>")
+                lines.append(
+                    f"<pre>{progress_bar(frac)} {pct(frac)}\n"
+                    f"{transfer_meta(fetch_done, fetch_total, speed)}</pre>"
+                )
             else:
                 elapsed = max(time.monotonic() - j.waiting_since for j in waiting)
-                lines.append(f"<pre>{progress_bar(0.0)} 0%\n⏳ preparing · {fmt_eta(elapsed)}</pre>")
+                lines.append(
+                    f"<pre>{progress_bar(0.0)} 0%\n"
+                    f"⏳ preparing · {fmt_eta(elapsed)}</pre>"
+                )
             return lines
 
         # Phase 2 — the transfer itself (cloud mode, or the fast local copy).
@@ -624,7 +633,10 @@ class Notifier:
             speed = sum(j.speed_bps for j in transferring)
             if total:
                 frac = min(1.0, done / total)
-                lines.append(f"<pre>{progress_bar(frac)} {pct(frac)}\n{transfer_meta(done, total, speed)}</pre>")
+                lines.append(
+                    f"<pre>{progress_bar(frac)} {pct(frac)}\n"
+                    f"{transfer_meta(done, total, speed)}</pre>"
+                )
             else:
                 lines.append("<pre>⏬ downloading…</pre>")
         return lines
@@ -645,7 +657,10 @@ class Notifier:
             else:
                 header = f"✅ <b>Saved</b> · <code>{volume}</code>"
         elif completed:
-            header = f"✅ <b>Saved {len(completed)}/{len(results)}</b> · <code>{human_size(total_bytes)}</code>"
+            header = (
+                f"✅ <b>Saved {len(completed)}/{len(results)}</b> · "
+                f"<code>{human_size(total_bytes)}</code>"
+            )
         elif cancelled and not failed:
             header = f"🚫 <b>Cancelled</b> · <code>{plural_files(len(cancelled))}</code>"
         else:
@@ -692,7 +707,8 @@ class Notifier:
         icon = type_icon(job.media_type)
         name = escape(job.file_name or job.rel_path)
         if job.status is JobStatus.COMPLETED:
-            return f"{icon} <i>{name}</i> · <code>{human_size(job.bytes_done or job.file_size)}</code>"
+            size = job.bytes_done or job.file_size
+            return f"{icon} <i>{name}</i> · <code>{human_size(size)}</code>"
         if job.status is JobStatus.CANCELLED:
             return f"🚫 <i>{name}</i> · cancelled"
         return f"❌ <i>{name}</i> — {escape((job.error or 'error')[:80])}"

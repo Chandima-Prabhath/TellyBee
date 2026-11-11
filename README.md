@@ -68,6 +68,17 @@ Built on **aiogram 3** (fully async), **Python 3.12**, and a
   leftover complete cache entry from an earlier download can never masquerade
   as the current one (once froze a new episode at the previous file's size,
   "stalled"). A fully-downloaded file awaiting its copy shows `✔ finishing`.
+- 🧹 **Self-cleaning botapi cache** — the local Bot API server keeps every
+  fetched file for 1–25 h and that is *not configurable* (the maintainers'
+  own words); TellyBee instead deletes each server-side copy the moment the
+  file is safely in `./downloads`, and a sweeper removes leftovers older
+  than `BOTAPI_CACHE_TTL_MINUTES` (default 2 h) — the volume only ever holds
+  in-flight fetches, not the whole day's downloads.
+- ⚡ **Stalls recover in seconds, not half hours** — a server-side fetch with
+  zero progress for `FETCH_STALL_TIMEOUT` (default 90 s) has its parked
+  `getFile` call cancelled and re-issued — free, since the server keeps its
+  progress — instead of idling until `GETFILE_TIMEOUT` (default 30 min)
+  expires.
 - ❤️ **Ops-friendly** — HTTP `/healthz` endpoint with queue metrics
   (docker healthcheck built in), text or JSON logs, polling *or* webhook
   mode, optional local Bot API server support for **files up to 4 GB**.
@@ -249,6 +260,10 @@ Everything is env-driven (`.env` file supported); human-friendly values like
 | `PREFETCH` | `true` | start fetching queued files on the local server immediately (local mode) |
 | `FETCH_CONCURRENCY` | `2` | max files the local server downloads from Telegram at once — workers **and** prefetch share these slots (1–8; low is right, see *Speeding up big-file downloads*) |
 | `FETCH_WATCH_INTERVAL` | `1.5` | seconds between fetch-progress volume scans |
+| `FETCH_STALL_TIMEOUT` | `90` | seconds of zero fetch progress before the parked `getFile` is cancelled and re-asked — the server keeps its download progress, so this is free (local mode; `0` = off) |
+| `BOTAPI_EVICT_AFTER_COPY` | `true` | delete the server-side cache copy as soon as the file is safely in `./downloads` (needs the `botapi-data` volume mounted read-write) |
+| `BOTAPI_CACHE_TTL_MINUTES` | `120` | sweeper deletes leftover botapi cache files older than this (`0` = no sweeping; eviction above still runs) |
+| `BOTAPI_CLEANUP_INTERVAL_MINUTES` | `15` | how often the cache sweeper runs |
 | `CHUNK_SIZE` | `256KB` | streaming chunk size |
 | `MAX_FILE_SIZE` | `20MB` | reject bigger files (≤ 20MB cloud · ≤ 4000MB with a local Bot API server) |
 | `LINKS_ENABLED` | `true` | allow direct http(s) link downloads |
@@ -342,14 +357,18 @@ Notes:
   `getFile` returns an *absolute path* inside the botapi container and the
   server has **no HTTP file endpoint at all**. The compose file therefore
   mounts the `botapi-data` volume into the tellybee container as well
-  (read-only), and the bot stream-copies files straight from it — fast and
+  (read-write), and the bot stream-copies files straight from it — fast and
   token-safe. If you maintain your own compose file, make sure the tellybee
   service includes:
 
   ```yaml
   volumes:
-    - botapi-data:/var/lib/telegram-bot-api:ro
+    - botapi-data:/var/lib/telegram-bot-api
   ```
+
+  (read-write — since v0.7 the bot deletes served files from the volume
+  after copying them; a `:ro` mount still *works*, but the disk-fill
+  protection silently disables itself with a warning in the logs)
 
 - **Why the first download of a big file takes a while:** the local server
   answers `getFile` only *after* it has fetched the whole file from Telegram
@@ -359,7 +378,9 @@ Notes:
   `/cancel` in the meantime; timeouts never burn the retry budget because
   the server keeps its download progress. While it waits, the engine
   **watches the server's shared volume** and shows real fetch progress
-  (% / speed / ETA) in chat instead of a frozen bar. Re-sending a file that
+  (% / speed / ETA) in chat instead of a frozen bar. A fetch that shows
+  *zero* progress for `FETCH_STALL_TIMEOUT` (default 90 s) is re-asked on
+  the spot instead of idling. Re-sending a file that
   is already in the `botapi-data` volume is near-instant — and since v0.2.0
   re-sending a file that is already in `./downloads` is skipped outright
   (duplicate detection by `file_unique_id`).
@@ -383,10 +404,16 @@ Notes:
   know. Uncomment the `127.0.0.1:8081` mapping in the compose file for local
   debugging only.
 - Telegram files are cached inside the `botapi-data` **named volume** before
-  the bot copies them to `./downloads` — a 4 GB file needs ~8 GB of free disk
-  at download time. The bot checks free space at intake and refuses files
-  that cannot fit; `/stats` shows free space on both volumes. Check usage
-  with `docker system df`.
+  the bot copies them to `./downloads` — since v0.7 the bot **deletes each
+  server-side copy right after the copy completes** and sweeps leftovers
+  older than `BOTAPI_CACHE_TTL_MINUTES` (default 2 h), so the volume only
+  ever holds in-flight fetches plus a small TTL window: a 4 GB file needs
+  roughly 4 GB of free disk at download time, not ~8 GB. (The Bot API
+  server's own retention is 1–25 h and not configurable — see
+  [tdlib/telegram-bot-api#303](https://github.com/tdlib/telegram-bot-api/issues/303),
+  which also confirms manual deletion is safe.) The bot checks free space
+  at intake and refuses files that cannot fit; `/stats` shows free space on
+  both volumes. Check usage with `docker system df`.
 - The bot token is masked (`***`) everywhere in the bot's own logs, and error
   messages shown in chat receipts never contain it — Bot API download URLs
   embed the token, so keep `docker compose logs` sharing safe too.
@@ -396,7 +423,7 @@ Notes:
 
 ### 🏎 Speeding up big-file downloads
 
-Four layers, all free:
+Five layers, all free:
 
 1. **Prefetching (on by default).** The slow part of local mode is the
    server downloading from Telegram — normally that only starts when a
@@ -431,6 +458,11 @@ Four layers, all free:
    ARM, then cached); afterwards single-file downloads typically run
    several times faster until your bandwidth becomes the ceiling. Keep the
    custom entrypoint either way.
+5. **Stalls never idle (v0.7+).** A server-side fetch showing zero progress
+   for `FETCH_STALL_TIMEOUT` (default 90 s) has its parked `getFile` call
+   cancelled and re-issued on the spot — the server keeps its download
+   progress, so the re-ask costs nothing and recovers wedged waits in
+   seconds instead of waiting out `GETFILE_TIMEOUT` (default 30 min).
 
 ---
 
@@ -514,11 +546,13 @@ Two more reboot facts worth knowing:
 
 - **Forwarded-while-down messages are not lost** — Telegram keeps
   unconfirmed updates for 24 h and re-delivers them when the bot returns.
-- **The botapi cache keeps completed files** — if only the tellybee
-  container restarted, files the local server had finished fetching are
-  still there: re-send (or re-queue) and the copy is near-instant.
+- **The botapi cache keeps completed files** — files the local server had
+  *finished* fetching survive a tellybee-only restart until the TTL (2 h
+  by default): re-send (or re-queue) within that window and the copy is
+  near-instant. Files already copied to `./downloads` are deleted from the
+  volume immediately (duplicate detection handles re-sends anyway).
   Half-finished server-side fetches are *not* resumed by the server; those
-  restart from zero.
+  restart from zero (and the sweeper removes their orphaned partials).
 
 For graceful shutdowns (`docker compose down/up --build`), the compose
 example sets `stop_grace_period: 40s` so the bot's 25 s drain can actually
@@ -549,8 +583,9 @@ before contributing (humans and AI assistants alike).
 | `Cannot connect to host botapi:8081` / `Connect call failed` | The two containers aren't on the same network — **`docker compose restart` does not apply compose-file edits**. Run `docker compose down && docker compose up -d --build` instead. The bot retries on its own in the meantime. |
 | botapi log shows no `--api-id=` flag | Its environment didn't get your credentials — same cause as above: recreate with `docker compose up -d --build` (never `restart`). |
 | Local server answers `404 Not Found` | Missing cloud `logOut` handshake — the bot performs it automatically at startup; if it could not reach the internet, restart after a minute. |
-| Every download fails with `404 … /file/bot…` | Old image downloaded via an HTTP file endpoint — local Bot API servers don't have one. Update to ≥ 0.1.2 and make sure the tellybee service mounts `botapi-data:/var/lib/telegram-bot-api:ro`, then `docker compose up -d --build`. |
-| `…is not mounted in this container…` in job errors | The `botapi-data` volume is not shared with the tellybee service — add `botapi-data:/var/lib/telegram-bot-api:ro` to its `volumes:` and recreate the container. |
+| Every download fails with `404 … /file/bot…` | Old image downloaded via an HTTP file endpoint — local Bot API servers don't have one. Update to ≥ 0.1.2 and make sure the tellybee service mounts `botapi-data:/var/lib/telegram-bot-api`, then `docker compose up -d --build`. |
+| `…is not mounted in this container…` in job errors | The `botapi-data` volume is not shared with the tellybee service — add `botapi-data:/var/lib/telegram-bot-api` to its `volumes:` and recreate the container. |
+| The `botapi-data` volume slowly fills the disk | Pre-0.7.0 the bot never deleted anything from it (the server's own retention is 1–25 h and not configurable). Update to ≥ 0.7.0 **and** drop `:ro` from the volume mount — the bot then deletes each file right after copying it and sweeps leftovers (`BOTAPI_CACHE_TTL_MINUTES`, default 2 h). On an older version, clean by hand: `docker compose exec tellybee find /var/lib/telegram-bot-api -path '*/files/*' -type f -mmin +120 -delete`. |
 | Every download fails with `[Errno 13] Permission denied: '/var/lib/telegram-bot-api/…'` | The botapi server runs as its own uid (101) and writes files `0600`, so tellybee (uid 1000) can't read them from the shared volume. Copy the current `botapi` service block — especially its `entrypoint:` uid-alignment wrapper — from `docker-compose.yml.example` into your compose file, then `docker compose down && docker compose up -d --build`. On SELinux-enforcing hosts (RHEL/Fedora) also add `:z` to the `botapi-data` volume mounts. |
 | Every large first-time download fails with `HTTP Client says - Request timeout error` | Pre-0.1.4 images killed the `getFile` wait at aiogram's default 60s — but a local server legitimately takes minutes to fetch a big file before answering. Update to ≥ 0.1.4 (`git pull && docker compose up -d --build`). On very slow links raise `GETFILE_TIMEOUT` (seconds; default 1800). Already-failed files are usually cached in the `botapi-data` volume by now — re-send them, they complete near-instantly. |
 | `unable to open database file` / `not writable` | Bind mounts owned by root — the entrypoint fixes this automatically on new images; manually: `sudo chown -R 1000:1000 ./data ./downloads`, then `docker compose restart`. |

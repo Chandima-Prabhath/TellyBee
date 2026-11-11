@@ -37,11 +37,16 @@ services:
       # REQUIRED with the local Bot API server (API_BASE=http://botapi:8081):
       # in --local mode getFile returns absolute paths into the server's
       # storage and the server has NO HTTP file endpoint — tellybee reads
-      # the bytes straight from this shared, read-only volume. The botapi
-      # service's entrypoint runs the server as the same uid (1000) so the
-      # owner-only file permissions line up. Remove this line only if you
-      # disabled the botapi service.
-      - botapi-data:/var/lib/telegram-bot-api:ro
+      # the bytes straight from this shared volume. The botapi service's
+      # entrypoint runs the server as the same uid (1000) so the
+      # owner-only file permissions line up. Read-WRITE since v0.7 (no
+      # ":ro" suffix): the bot's cache cleaner deletes each file right
+      # after copying it to ./downloads and sweeps stale leftovers
+      # (BOTAPI_CACHE_TTL_MINUTES, default 2 h) — the server's own
+      # retention is 1–25 h and not configurable, which otherwise slowly
+      # fills small disks. Remove this line only if you disabled the
+      # botapi service.
+      - botapi-data:/var/lib/telegram-bot-api
     ports:
       # Health endpoint /healthz (and the webhook receiver if WEBHOOK_URL
       # is set). Bound to localhost by default — drop the "127.0.0.1:"
@@ -125,9 +130,11 @@ services:
     volumes:
       # Named volume on purpose (not a bind mount): docker initializes it
       # with the image's own ownership, and the entrypoint above hands it
-      # to uid 1000 on every start. Telegram files up to 2 GB are cached
-      # here before the bot copies them to ./downloads — keep an eye on
-      # disk usage ("docker system df").
+      # to uid 1000 on every start. Telegram files are cached
+      # here before the bot copies them to ./downloads — since v0.7 the bot
+      # deletes its copies immediately after the copy completes and sweeps
+      # stale leftovers (BOTAPI_CACHE_TTL_MINUTES), so the volume only ever
+      # holds in-flight fetches plus a small TTL window.
       - botapi-data:/var/lib/telegram-bot-api
     # Deliberately NOT published to the host: only the tellybee container
     # needs it over the internal compose network, and an exposed Bot API

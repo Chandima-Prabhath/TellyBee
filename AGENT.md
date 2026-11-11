@@ -232,8 +232,22 @@ before any of the tags wrap it.
   10.3 sources: `HttpConnection::handle` only routes `/bot<token>/<method>`;
   `/file/...` always 404s. In `--local` mode `getFile` returns an *absolute
   path* inside the server's storage, so the engine stream-copies from the
-  shared `botapi-data` volume (mounted read-only at the same path). HTTP
-  fetching stays only for the cloud API.
+  shared `botapi-data` volume (mounted read-write at the same path since
+  v0.7 — the cache cleaner deletes served files; `:ro` still *reads* fine
+  but cleanup disables itself). HTTP fetching stays only for the cloud API.
+- **The server's cache retention is 1–25 h and NOT configurable**
+  (tdlib/telegram-bot-api#303, maintainer's own words), and manual deletion
+  of downloaded files is explicitly allowed. `app/services.botapi_cache`
+  therefore deletes each server-side copy right after the copy to
+  `./downloads` completes (plus the file_id→path cache entry, so waiters
+  never receive a ghost path) and sweeps leftovers older than
+  `BOTAPI_CACHE_TTL_MINUTES` — but only inside the bot's own `files/`
+  subtree (learned from observed getFile paths; the server's TDLib
+  database/binlogs elsewhere in the volume are never touched), only
+  entries unchanged across two sweeps (a file that still grows is an
+  active download, whatever bookkeeping says), and never a path the engine
+  declared protected (in-flight watcher matches / live getFile mappings).
+  Log lines must never contain volume paths — they embed the bot token.
 - **The local Bot API server writes files as its own uid with owner-only
   permissions.** Verified against upstream sources: the server `setuid()`s
   itself via `--username` (`td::change_user` → `getpwnam`, *names only, no

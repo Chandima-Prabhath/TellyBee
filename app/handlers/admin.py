@@ -72,7 +72,10 @@ async def stats_text(db: Database, manager: DownloadManager, settings: Settings)
         body = []
         for rank, row in enumerate(stats["top_users"], start=1):
             name = escape(str(row["name"]))
-            body.append(f"{rank}. <i>{name}</i> — <code>{row['count']} · {human_size(row['bytes'])}</code>")
+            body.append(
+                f"{rank}. <i>{name}</i> — "
+                f"<code>{row['count']} · {human_size(row['bytes'])}</code>"
+            )
         newline = "\n"
         opening = "blockquote expandable" if len(body) > 5 else "blockquote"
         lines.append(f"\n🏆 <b>Top savers</b>\n<{opening}>{newline.join(body)}</{opening}>")

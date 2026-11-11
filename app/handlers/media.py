@@ -196,8 +196,12 @@ async def _already_saved(
 
 
 async def _reply_duplicates(message: Message, duplicates: list[tuple[str, str]]) -> None:
-    lines = [f"♻️ <b>Already saved</b> · <code>skipped {plural_files(len(duplicates))}</code>"]
-    body = [f"<i>{escape(name)}</i> → <code>{escape(saved)}</code>" for name, saved in duplicates[:8]]
+    skipped = plural_files(len(duplicates))
+    lines = [f"♻️ <b>Already saved</b> · <code>skipped {skipped}</code>"]
+    body = [
+        f"<i>{escape(name)}</i> → <code>{escape(saved)}</code>"
+        for name, saved in duplicates[:8]
+    ]
     if len(duplicates) > 8:
         body.append(f"<i>… and {len(duplicates) - 8} more</i>")
     lines.append(f"<blockquote>{NEWLINE.join(body)}</blockquote>")
